@@ -1891,7 +1891,24 @@ func supportedDirInfoClass(c uint8) bool {
 // os.ReadDir and here. The cursor has to follow `consumed`: advancing by the
 // record count would leave it behind the scan position, so the next call
 // re-encodes entries the client already received.
+//
+// Records are linked as they are appended, carrying the previous record's start
+// offset in a local. Re-deriving it by walking the NextEntryOffset chain from
+// the head of the buffer made linking quadratic in the number of records in a
+// *single* response: at the 8 MiB this server advertises as MaxTransactSize
+// that is ~75k records and ~2.8G list steps, seconds of CPU that any client
+// honouring the advertised buffer can ask for over and over.
+//
+// Every record is also priced from its name before a single syscall is made for
+// it. A record is a fixed size per class plus two bytes per UTF-16 code unit of
+// the name, rounded up to 8, so the entry that straddles the end of the buffer
+// is left for the next call instead of being stat'ed, xattr-probed, encoded and
+// then discarded.
 func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit int, useAAPL bool) (out []byte, consumed, encoded int, err error) {
+	fixed, ok := dirRecordFixedSize(infoClass)
+	if !ok {
+		return nil, 0, 0, errUnsupportedDirInfoClass
+	}
 	// maxBytes is client-chosen (bounded by MaxTransactSize upstream) and most
 	// listings are far smaller, so cap the up-front reservation and let append
 	// grow rather than allocating megabytes on every request.
@@ -1907,57 +1924,103 @@ func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit in
 	if open.Tree != nil && open.Tree.Share.ReadOnly {
 		maxAccess = 0x001200A9
 	}
+	// FILE_NAMES_INFORMATION is NextEntryOffset + FileIndex + FileNameLength +
+	// the name (MS-FSCC §2.4.26) — nothing the stat could fill in. Calling
+	// Info() for it is one lstat per entry for fields that are never encoded.
+	needStat := infoClass != smb2.InfoFileNamesInformation
+	// Start offset of the record appended most recently, so the chain is linked
+	// in constant time per record rather than by re-walking it.
+	prevStart := 0
 	for i := open.dirSent; i < len(open.dirEntries) && encoded < limit; i++ {
 		ent := open.dirEntries[i]
-		info, ierr := ent.Info()
-		if ierr != nil || info == nil {
-			// The entry vanished between the scan and now (or is an
-			// unstattable synthetic "."/".."). Skip the record but still count
-			// the entry as consumed so the cursor keeps pace with i.
-			consumed = i + 1 - open.dirSent
-			continue
+		name := ent.Name()
+		// Price the record from the name alone, before any I/O. An entry that
+		// does not fit is re-offered on the next call, so its lstat and
+		// resource-fork probe would be done twice and used once.
+		if len(out)+padTo8(fixed+utf16leLen(name)) > maxBytes {
+			break
+		}
+		var info os.FileInfo
+		if needStat {
+			fi, ierr := ent.Info()
+			if ierr != nil || fi == nil {
+				// The entry vanished between the scan and now (or is an
+				// unstattable synthetic "."/".."). Skip the record but still
+				// count the entry as consumed so the cursor keeps pace with i.
+				consumed = i + 1 - open.dirSent
+				continue
+			}
+			info = fi
 		}
 		var rforkSize uint64
-		if useAAPL && !info.IsDir() {
+		if useAAPL && info != nil && !info.IsDir() {
 			// Report the AAPL resource-fork size from its backing ADS xattr.
-			if data, xerr := readStreamXattr(filepath.Join(open.Path, ent.Name()), rforkStreamName); xerr == nil {
-				rforkSize = uint64(len(data))
+			// Only the length is wanted, so size the attribute rather than
+			// reading the whole fork into memory to call len() on it.
+			if n, xerr := streamXattrSize(filepath.Join(open.Path, name), rforkStreamName); xerr == nil {
+				rforkSize = uint64(n)
 			}
 		}
-		rec := encodeDirRecord(ent.Name(), info, infoClass, useAAPL, maxAccess, rforkSize)
+		rec := encodeDirRecord(name, info, infoClass, useAAPL, maxAccess, rforkSize)
 		if rec == nil {
 			return nil, 0, 0, errUnsupportedDirInfoClass
 		}
-		padded := rec
-		if len(rec)%8 != 0 {
-			padded = append(append([]byte{}, rec...), make([]byte, 8-len(rec)%8)...)
-		}
-		if len(out)+len(padded) > maxBytes {
-			// Doesn't fit — leave `consumed` where it is so this entry is
-			// re-offered on the next call.
+		// Pad from the encoded record, never from the estimate above: the
+		// estimate only gates the fit check, and a one-byte drift in the
+		// padding is a silent wire corruption rather than an error. Should the
+		// real record ever overrun the budget, leave it for the next call.
+		padded := padTo8(len(rec))
+		if len(out)+padded > maxBytes {
 			break
 		}
 		if encoded > 0 {
-			prevStart := lastRecordStart(out)
 			binary.LittleEndian.PutUint32(out[prevStart:], uint32(len(out)-prevStart))
 		}
-		out = append(out, padded...)
+		prevStart = len(out)
+		out = append(out, rec...)
+		out = append(out, dirRecordPadding[:padded-len(rec)]...)
 		encoded++
 		consumed = i + 1 - open.dirSent
 	}
 	return out, consumed, encoded, nil
 }
 
-func lastRecordStart(buf []byte) int {
-	// Walk the linked list to find the last record start.
-	off := 0
-	for {
-		next := binary.LittleEndian.Uint32(buf[off:])
-		if next == 0 {
-			return off
-		}
-		off += int(next)
+// dirRecordPadding supplies the zero bytes that align a record to 8; a record
+// never needs more than seven.
+var dirRecordPadding [8]byte
+
+// padTo8 rounds n up to the next multiple of 8. Directory records are 8-byte
+// aligned, so a record's padded length is exactly its NextEntryOffset.
+func padTo8(n int) int {
+	if r := n % 8; r != 0 {
+		return n + 8 - r
 	}
+	return n
+}
+
+// dirRecordFixedSize returns the size of the name-independent part of a record
+// for infoClass, and whether encodeDirRecord can emit that class at all.
+//
+// It must stay in lockstep with encodeDirRecord's per-class layout: these sizes
+// are fixed by MS-FSCC, and they are what lets the enumerator decide whether an
+// entry fits before doing any I/O for it. TestDirEncode_FixedSizesMatchEncoder
+// pins them to what encodeDirRecord actually emits.
+func dirRecordFixedSize(infoClass uint8) (int, bool) {
+	switch infoClass {
+	case smb2.InfoFileDirectoryInformation:
+		return 64, true // MS-FSCC §2.4.10
+	case smb2.InfoFileFullDirectoryInformation:
+		return 68, true // MS-FSCC §2.4.14
+	case smb2.InfoFileNamesInformation:
+		return 12, true // MS-FSCC §2.4.26
+	case smb2.InfoFileBothDirectoryInformation:
+		return 94, true // MS-FSCC §2.4.8
+	case smb2.InfoFileIdFullDirectoryInformation:
+		return 80, true // MS-FSCC §2.4.20
+	case smb2.InfoFileIdBothDirectoryInformation:
+		return 104, true // MS-FSCC §2.4.17
+	}
+	return 0, false
 }
 
 // encodeDirRecord builds a single directory entry record. Supported classes:
@@ -2605,6 +2668,22 @@ func utf16leName(s string) []byte {
 		}
 	}
 	return out
+}
+
+// utf16leLen returns the number of bytes utf16leName would produce for s,
+// without building the encoding. The enumerator uses it to size a record before
+// deciding whether the entry fits; it must agree with utf16leName byte for
+// byte, which TestDirEncode_UTF16LenMatchesEncoder checks.
+func utf16leLen(s string) int {
+	n := 0
+	for _, r := range s {
+		if r <= 0xFFFF {
+			n += 2
+		} else {
+			n += 4
+		}
+	}
+	return n
 }
 
 // silence unused-vars for the dispatcher's helpers when not referenced.

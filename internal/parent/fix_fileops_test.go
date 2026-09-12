@@ -168,19 +168,27 @@ func TestFileOps_QueryDirSurvivesUnstattableEntry(t *testing.T) {
 		entries[1],
 	}
 
-	want := []string{"a.txt", "b.txt"}
 	// Every record class must survive it. The classes that read info.ModTime()
-	// / info.IsDir() are the ones that used to panic; FILE_NAMES_INFORMATION
-	// only reads the name, so it would merely have emitted a bogus "ghost".
+	// / info.IsDir() are the ones that used to panic.
+	//
+	// FILE_NAMES_INFORMATION is the exception: it encodes nothing but the name
+	// (MS-FSCC §2.4.26), so the enumerator no longer stats its entries at all —
+	// one lstat per entry for fields it never reads. It therefore emits the
+	// name readdir handed it, "ghost" included, which is ordinary POSIX
+	// readdir behaviour: a name can be unlinked between readdir and the stat.
+	// The point of this test is that nothing panics, not that the name is
+	// filtered, and the stat-bearing classes below still filter it.
+	want := []string{"a.txt", "b.txt"}
 	classes := []struct {
 		class             uint8
 		fixed, nameLenOff int
+		want              []string
 	}{
-		{smb2.InfoFileNamesInformation, 12, 8},
-		{smb2.InfoFileDirectoryInformation, 64, 60},
-		{smb2.InfoFileBothDirectoryInformation, 94, 60},
-		{smb2.InfoFileIdBothDirectoryInformation, 104, 60},
-		{smb2.InfoFileIdFullDirectoryInformation, 80, 60},
+		{smb2.InfoFileNamesInformation, 12, 8, []string{"a.txt", "ghost", "b.txt"}},
+		{smb2.InfoFileDirectoryInformation, 64, 60, want},
+		{smb2.InfoFileBothDirectoryInformation, 94, 60, want},
+		{smb2.InfoFileIdBothDirectoryInformation, 104, 60, want},
+		{smb2.InfoFileIdFullDirectoryInformation, 80, 60, want},
 	}
 	for _, c := range classes {
 		open.dirSent = 0
@@ -191,12 +199,12 @@ func TestFileOps_QueryDirSurvivesUnstattableEntry(t *testing.T) {
 			t.Fatalf("class %#x: QUERY_DIRECTORY status = %#x, want SUCCESS", c.class, uint32(got))
 		}
 		names := decodeDirRecordNames(t, queryDirBuffer(t, &buf), c.fixed, c.nameLenOff)
-		if len(names) != len(want) {
-			t.Fatalf("class %#x: names = %v, want %v", c.class, names, want)
+		if len(names) != len(c.want) {
+			t.Fatalf("class %#x: names = %v, want %v", c.class, names, c.want)
 		}
-		for i := range want {
-			if names[i] != want[i] {
-				t.Fatalf("class %#x: names = %v, want %v", c.class, names, want)
+		for i := range c.want {
+			if names[i] != c.want[i] {
+				t.Fatalf("class %#x: names = %v, want %v", c.class, names, c.want)
 			}
 		}
 	}
@@ -268,7 +276,7 @@ func TestFileOps_QueryDirCursorTracksConsumedEntries(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		var buf bytes.Buffer
 		d.handleQueryDirectory(&buf, smb2.Header{Command: smb2.CommandQueryDirectory},
-			buildQueryDirBody(open.FileID, smb2.InfoFileNamesInformation,
+			buildQueryDirBody(open.FileID, smb2.InfoFileDirectoryInformation,
 				smb2.QueryDirReturnSingleEntry, 64<<10, "*"), sess)
 		st := frameStatus(t, &buf)
 		if st == smb2.StatusNoMoreFiles {
@@ -277,7 +285,11 @@ func TestFileOps_QueryDirCursorTracksConsumedEntries(t *testing.T) {
 		if st != smb2.StatusSuccess {
 			t.Fatalf("iteration %d status = %#x, want SUCCESS or NO_MORE_FILES", i, uint32(st))
 		}
-		got = append(got, decodeNamesInfo(t, queryDirBuffer(t, &buf))...)
+		// FILE_DIRECTORY_INFORMATION rather than FILE_NAMES_INFORMATION: the
+		// names class no longer stats its entries, so it never drops one and
+		// could not exercise the consumed-vs-encoded divergence this test is
+		// about. Both classes share the same NextEntryOffset chain.
+		got = append(got, decodeDirRecordNames(t, queryDirBuffer(t, &buf), 64, 60)...)
 	}
 
 	want := []string{"a.txt", "b.txt", "c.txt"}

@@ -94,6 +94,33 @@ func getxattr(path, name string) ([]byte, error) {
 	return buf[:n], nil
 }
 
+// getxattrSize returns the length in bytes of a single xattr's value without
+// reading it. A missing attribute returns (0, nil). ENOTSUP returns
+// errXattrUnsupported.
+//
+// This exists because callers that only want a size were paying for the value:
+// getxattr issues a sizing Getxattr and then a second one that copies the whole
+// attribute into memory. For an AAPL resource fork that is the entire fork read
+// per directory entry, per QUERY_DIRECTORY, purely to call len() on it.
+func getxattrSize(path, name string) (int, error) {
+	size, err := unix.Getxattr(path, name, nil)
+	if err != nil {
+		if e := classifyXattrErr(err); e != nil {
+			return 0, e
+		}
+		// Attribute not present — same as zero bytes for sizing purposes.
+		return 0, nil
+	}
+	return size, nil
+}
+
+// streamXattrSize returns the byte length of the named stream's content on path
+// without reading the content. A stream that was never written returns
+// (0, nil) — same as readStreamXattr's (nil, nil).
+func streamXattrSize(path, stream string) (int, error) {
+	return getxattrSize(path, streamXattrName(stream))
+}
+
 // listXattrNames enumerates all xattr names on path. A filesystem without xattr
 // support returns errXattrUnsupported.
 func listXattrNames(path string) ([]string, error) {

@@ -248,7 +248,7 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		// disk-file-id: buildCreateResponseContexts then omits QFid entirely
 		// instead of reporting an id of zero, which would make macOS drop
 		// File-ID support for the rest of the session.
-		CreateContexts: buildCreateResponseContexts(req.CreateContexts, d.Conn, maxAccess, 0, 0),
+		CreateContexts: buildCreateResponseContexts(req.CreateContexts, d.Conn, tree, maxAccess, 0, 0),
 	})
 	d.respondSuccess(rw, hdr, sess, resp)
 	return true

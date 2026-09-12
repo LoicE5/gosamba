@@ -1104,7 +1104,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 
 	// Register a durable handle and collect the extra response contexts
 	// (DH2Q/DHnQ echo, RqLs lease grant) to append to the AAPL/MxAc/QFid set.
-	respCtxs := buildCreateResponseContexts(req.CreateContexts, d.Conn, granted, diskFileID, volumeID)
+	respCtxs := buildCreateResponseContexts(req.CreateContexts, d.Conn, tree, granted, diskFileID, volumeID)
 	respCtxs = d.applyDurableAndLease(open, durReq, leaseReq, respCtxs, sess.User.Name)
 
 	resp := smb2.EncodeCreateResponse(smb2.CreateResponse{
@@ -2931,7 +2931,7 @@ func encodeFsInfo(class uint8, o *Open) ([]byte, bool) {
 		// FileSystemAttributes(4) + MaxFileNameLength(4) + FileSystemNameLength(4) + Name (UTF-16LE)
 		//
 		// Bits we claim (MS-FSCC §2.5.1):
-		//   0x00000001 FILE_CASE_SENSITIVE_SEARCH
+		//   0x00000001 FILE_CASE_SENSITIVE_SEARCH — only when the share's backing filesystem really is (see fsAttributes)
 		//   0x00000002 FILE_CASE_PRESERVED_NAMES
 		//   0x00000004 FILE_UNICODE_ON_DISK
 		//   0x00000008 FILE_PERSISTENT_ACLS
@@ -2942,7 +2942,7 @@ func encodeFsInfo(class uint8, o *Open) ([]byte, bool) {
 		//   0x00800000 FILE_SUPPORTS_EXTENDED_ATTRIBUTES — required for macOS
 		//                                    Versions ("permanent version
 		//                                    storage") to enable on the share.
-		const fsAttrs uint32 = 0x0084004F
+		fsAttrs := fsAttributes(o.Tree)
 		name := utf16leName("NTFS")
 		out := make([]byte, 12+len(name))
 		binary.LittleEndian.PutUint32(out[0:], fsAttrs)

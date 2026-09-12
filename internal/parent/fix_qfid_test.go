@@ -165,7 +165,7 @@ func TestQFid_NotEmittedWhenNotRequested(t *testing.T) {
 // exactly what makes macOS give up on file IDs for the session.
 func TestQFid_OmittedWithoutRealInode(t *testing.T) {
 	// Direct: the builder must drop QFid when handed a zero inode.
-	out := buildCreateResponseContexts(qfidReqCtx(), nil, 0x001F01FF, 0, 0)
+	out := buildCreateResponseContexts(qfidReqCtx(), nil, nil, 0x001F01FF, 0, 0)
 	if _, ok := findContext(out, "QFid"); ok {
 		t.Fatal("QFid emitted with a zero DiskFileId")
 	}
@@ -174,7 +174,7 @@ func TestQFid_OmittedWithoutRealInode(t *testing.T) {
 		{Name: []byte("MxAc"), Data: nil},
 		{Name: []byte("QFid"), Data: nil},
 	})
-	out = buildCreateResponseContexts(both, nil, 0x001F01FF, 0, 0)
+	out = buildCreateResponseContexts(both, nil, nil, 0x001F01FF, 0, 0)
 	if _, ok := findContext(out, "QFid"); ok {
 		t.Fatal("QFid emitted with a zero DiskFileId (mixed context set)")
 	}

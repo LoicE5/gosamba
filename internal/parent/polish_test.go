@@ -11,22 +11,21 @@ import (
 	"github.com/ahmetozer/gosamba/internal/smb2"
 )
 
-// TestF10_FsAttributesCaseSensitive pins the FileFsAttributeInformation bits
-// to confirm we advertise FILE_CASE_SENSITIVE_SEARCH (0x1).
+// TestF10_FsAttributesCaseSensitive pins the FileFsAttributeInformation bits.
 //
-// Decision (F10, option a): We keep advertising FILE_CASE_SENSITIVE_SEARCH
-// because the underlying filesystem (ext4 by default) IS case-sensitive.
-// Advertising case-insensitive while the FS remains case-sensitive would be
-// a lie that could cause name collisions that the server cannot resolve.
-// Clients (Windows, macOS) handle case-sensitive shares correctly; they simply
-// cannot create two files differing only in case (their shells prevent it).
-// This is the lowest-risk, self-consistent choice.
+// FILE_CASE_SENSITIVE_SEARCH (0x1) is NOT pinned here: it now tracks the
+// share's backing filesystem, which differs between an ext4 CI runner and a
+// default APFS/HFS+ macOS box. The bit's correctness is asserted against a
+// probe of the real filesystem in fix_casesens_test.go; what this test still
+// pins is that the unconditional bits are unchanged and that the conditional
+// one agrees with shareCaseSensitive.
 func TestF10_FsAttributesCaseSensitive(t *testing.T) {
-	// Construct a minimal Open so encodeFsInfo doesn't panic.
+	// A real directory: encodeFsInfo now probes the share's filesystem.
+	dir := t.TempDir()
 	o := &Open{
-		Path: "/tmp",
+		Path: dir,
 		Tree: &Tree{
-			Share: config.ShareConfig{Name: "test", Path: "/tmp"},
+			Share: config.ShareConfig{Name: "test", Path: dir},
 		},
 	}
 
@@ -41,14 +40,14 @@ func TestF10_FsAttributesCaseSensitive(t *testing.T) {
 	fsAttrs := binary.LittleEndian.Uint32(buf[0:4])
 
 	const (
-		fileCaseSensitiveSearch = 0x00000001
-		fileCasePreservedNames  = 0x00000002
-		fileUnicodeOnDisk       = 0x00000004
+		fileCasePreservedNames = 0x00000002
+		fileUnicodeOnDisk      = 0x00000004
 	)
 
-	// Must advertise case-sensitive search (F10 decision: option a).
-	if fsAttrs&fileCaseSensitiveSearch == 0 {
-		t.Errorf("FILE_CASE_SENSITIVE_SEARCH (0x1) should be set; fsAttrs=0x%08X", fsAttrs)
+	// Case-sensitive search is reported only when the filesystem really is.
+	wantCase := shareCaseSensitive(o.Tree)
+	if got := fsAttrs&fileCaseSensitiveSearch != 0; got != wantCase {
+		t.Errorf("FILE_CASE_SENSITIVE_SEARCH = %v, want %v (probed); fsAttrs=0x%08X", got, wantCase, fsAttrs)
 	}
 	// Must also advertise case-preserved names (we never alter case on disk).
 	if fsAttrs&fileCasePreservedNames == 0 {

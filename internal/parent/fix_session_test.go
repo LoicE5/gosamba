@@ -224,17 +224,39 @@ func giveSessionAnOpen(t *testing.T, sess *Session) *Open {
 	return o
 }
 
-// trackClosures wires the teardown hook ServeConn supplies in production and
-// records which sessions it was asked to close.
-func trackClosures(hs *fixCryptoHarness, closed *[]uint64) {
-	hs.h.ClosePreviousSession = func(prev *Session) {
-		*closed = append(*closed, prev.ID)
-		for _, o := range prev.TakeAllOpens() {
-			if o.File != nil {
-				o.File.Close()
-				o.File = nil
-			}
-		}
+// assertSessionAlive fails unless the session is still reachable everywhere it
+// should be and still owns the handle it was given.
+func assertSessionAlive(t *testing.T, hs *fixCryptoHarness, sess *Session, held *Open, what string) {
+	t.Helper()
+	if hs.index.get(sess.ID) == nil {
+		t.Errorf("%s: session %d was dropped from the server index", what, sess.ID)
+	}
+	if hs.h.Sessions.Get(sess.ID) == nil {
+		t.Errorf("%s: session %d was dropped from its connection table", what, sess.ID)
+	}
+	if sess.OpenCount() != 1 {
+		t.Errorf("%s: session %d holds %d opens, want 1", what, sess.ID, sess.OpenCount())
+	}
+	if held != nil && held.File == nil {
+		t.Errorf("%s: session %d had its descriptor closed", what, sess.ID)
+	}
+}
+
+// assertSessionClosed fails unless the session is gone from both tables and has
+// given up everything it owned.
+func assertSessionClosed(t *testing.T, hs *fixCryptoHarness, sess *Session, held *Open) {
+	t.Helper()
+	if hs.index.get(sess.ID) != nil {
+		t.Errorf("session %d is still in the server index after being superseded", sess.ID)
+	}
+	if hs.h.Sessions.Get(sess.ID) != nil {
+		t.Errorf("session %d is still usable on its connection after being superseded", sess.ID)
+	}
+	if sess.OpenCount() != 0 {
+		t.Errorf("superseded session still holds %d opens", sess.OpenCount())
+	}
+	if held != nil && held.File != nil {
+		t.Error("superseded session's descriptor was not closed")
 	}
 }
 
@@ -245,8 +267,6 @@ func trackClosures(hs *fixCryptoHarness, closed *[]uint64) {
 // blocked the new session.
 func TestFixSession_PreviousSessionIdClosesOldSession(t *testing.T) {
 	hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixSessionUsers())
-	var closed []uint64
-	trackClosures(hs, &closed)
 
 	first := fixSessionAuthenticate(t, hs, 1, "alice", "test123", 0)
 	held := giveSessionAnOpen(t, first)
@@ -255,20 +275,12 @@ func TestFixSession_PreviousSessionIdClosesOldSession(t *testing.T) {
 	if second.ID == first.ID {
 		t.Fatal("reconnect reused the previous session id")
 	}
-	if len(closed) != 1 || closed[0] != first.ID {
-		t.Fatalf("teardown hook calls = %v, want exactly [%d]", closed, first.ID)
-	}
-	if got := hs.h.Sessions.Get(first.ID); got != nil {
-		t.Error("previous SessionId is still usable after the reconnect")
-	}
-	if first.OpenCount() != 0 {
-		t.Errorf("previous session still holds %d opens", first.OpenCount())
-	}
-	if held.File != nil {
-		t.Error("previous session's descriptor was not closed")
-	}
+	assertSessionClosed(t, hs, first, held)
 	if hs.h.Sessions.Get(second.ID) == nil {
 		t.Error("the new session is not in the table")
+	}
+	if hs.index.get(second.ID) == nil {
+		t.Error("the new session is not in the server index")
 	}
 }
 
@@ -276,43 +288,38 @@ func TestFixSession_PreviousSessionIdClosesOldSession(t *testing.T) {
 // naming someone else's SessionId must not close their session.
 func TestFixSession_PreviousSessionIdIgnoredForOtherUsers(t *testing.T) {
 	hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixSessionUsers())
-	var closed []uint64
-	trackClosures(hs, &closed)
 
 	victim := fixSessionAuthenticate(t, hs, 1, "alice", "test123", 0)
 	held := giveSessionAnOpen(t, victim)
 
 	fixSessionAuthenticate(t, hs, 3, "bob", "hunter2", victim.ID)
-	if len(closed) != 0 {
-		t.Fatalf("bob's reconnect closed %v", closed)
-	}
-	if hs.h.Sessions.Get(victim.ID) == nil {
-		t.Error("alice's session was removed from the table by bob")
-	}
-	if held.File == nil || victim.OpenCount() != 1 {
-		t.Error("alice's handles were torn down by bob")
-	}
+	assertSessionAlive(t, hs, victim, held, "bob named alice's SessionId")
 }
 
 // TestFixSession_PreviousSessionIdEdgeCases covers the ids that must do
 // nothing: zero, an unknown id, the session's own id, and a half-open session
 // that never finished authenticating.
 func TestFixSession_PreviousSessionIdEdgeCases(t *testing.T) {
-	t.Run("zero and unknown", func(t *testing.T) {
+	t.Run("zero", func(t *testing.T) {
 		hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixSessionUsers())
-		var closed []uint64
-		trackClosures(hs, &closed)
-		fixSessionAuthenticate(t, hs, 1, "alice", "test123", 0)
+		first := fixSessionAuthenticate(t, hs, 1, "alice", "test123", 0)
+		held := giveSessionAnOpen(t, first)
+		fixSessionAuthenticate(t, hs, 3, "alice", "test123", 0)
+		assertSessionAlive(t, hs, first, held, "PreviousSessionId of zero")
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixSessionUsers())
+		first := fixSessionAuthenticate(t, hs, 1, "alice", "test123", 0)
+		held := giveSessionAnOpen(t, first)
+		// An id that names nothing must be a silent no-op, never an error:
+		// after a server restart every client's saved SessionId is unknown.
 		fixSessionAuthenticate(t, hs, 3, "alice", "test123", 0xDEADBEEF)
-		if len(closed) != 0 {
-			t.Fatalf("closed %v for a zero/unknown PreviousSessionId", closed)
-		}
+		assertSessionAlive(t, hs, first, held, "unknown PreviousSessionId")
 	})
 
 	t.Run("names itself", func(t *testing.T) {
 		hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixSessionUsers())
-		var closed []uint64
-		trackClosures(hs, &closed)
 		leg := hs.leg1(t, 1)
 		auth := buildAuthenticate(t, leg, "alice", "WORKGROUP", "test123", true, nil)
 		hdr, body, frame := sessionSetupFrameWithPrev(auth.secBuf, 2, leg.sessionID, leg.sessionID)
@@ -320,27 +327,21 @@ func TestFixSession_PreviousSessionIdEdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("session setup: %v", err)
 		}
-		if len(closed) != 0 {
-			t.Fatalf("a session naming itself closed %v", closed)
-		}
-		if hs.h.Sessions.Get(sess.ID) == nil {
-			t.Fatal("the session removed itself")
-		}
+		held := giveSessionAnOpen(t, sess)
+		assertSessionAlive(t, hs, sess, held, "a session naming itself")
 	})
 
 	t.Run("half-open previous session", func(t *testing.T) {
 		hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixSessionUsers())
-		var closed []uint64
-		trackClosures(hs, &closed)
 		// A type-1 leg with no type-3: the session exists but is not
 		// authenticated, so nobody owns it and it must not be closable.
 		halfOpen := hs.leg1(t, 1)
 		fixSessionAuthenticate(t, hs, 3, "alice", "test123", halfOpen.sessionID)
-		if len(closed) != 0 {
-			t.Fatalf("closed %v for an unauthenticated previous session", closed)
-		}
 		if hs.h.Sessions.Get(halfOpen.sessionID) == nil {
 			t.Error("the half-open session was removed")
+		}
+		if hs.index.get(halfOpen.sessionID) != nil {
+			t.Error("a half-open session was registered in the server index")
 		}
 	})
 }

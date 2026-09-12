@@ -313,7 +313,18 @@ func (d *Dispatcher) awaitLock(rw io.ReadWriter, hdr smb2.Header, sess *Session,
 		// its timeout while the range sits free.
 		released := d.locks.releaseSignal()
 
+		// Hold the handle for the retry. applyLockOps fcntls on open.File, and
+		// this goroutine is the one place that touches a descriptor without the
+		// dispatcher's per-message hold — so without this it can race a release
+		// (a CLOSE, a TREE_DISCONNECT, or a cross-connection session teardown)
+		// that is closing the very fd it is about to lock. The lock is taken
+		// SHARED and only around the attempt: the select below must not hold
+		// it, or a release would wait out this request's whole timeout.
+		// handleLock's own call is left alone — it already runs under this
+		// lock, held exclusively for the length of the message.
+		open.mu.RLock()
 		idx, err := d.applyLockOps(open, ops)
+		open.mu.RUnlock()
 		switch {
 		case err == nil:
 			d.sendAsync(rw, hdr, sess, asyncID, smb2.StatusSuccess, smb2.EncodeLockResponse())

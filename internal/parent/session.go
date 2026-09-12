@@ -184,9 +184,17 @@ type Session struct {
 	ntlmNegotiate []byte
 	ntlmChallenge []byte
 
-	mu         sync.Mutex
-	trees      map[uint32]*Tree
-	opens      map[[16]byte]*Open
+	mu    sync.Mutex
+	trees map[uint32]*Tree
+	opens map[[16]byte]*Open
+	// dead latches when TakeAllOpens has claimed this session's handles for
+	// release — LOGOFF, connection teardown, or a reconnect superseding it.
+	// Once set, AddOpen refuses, because a handle added to the map after that
+	// point is reachable by nobody: no later RemoveOpen or TakeAllOpens will
+	// ever run on it, so its descriptor and its share-mode reservation would be
+	// held for the life of the process, and a leaked reservation makes the file
+	// unopenable by every client on every connection. See AddOpen.
+	dead       bool
 	nextTreeID atomic.Uint32
 }
 
@@ -252,10 +260,21 @@ func (s *Session) RemoveTreeAndOpens(id uint32) []*Open {
 }
 
 // TakeAllOpens removes and returns every open in the session, for LOGOFF or
-// session teardown.
+// session teardown, and marks the session dead so nothing can be added behind
+// it. The caller owns the release of everything returned.
+//
+// The dead latch is not bookkeeping, it is the other half of the ownership
+// rule. Taking the map is only "I now own every handle this session has" if the
+// map cannot be repopulated afterwards, and it can be: handleCreate resolves
+// its session at the top of the message and then does real filesystem work
+// before AddOpen, so a CREATE already in flight on the owning connection can
+// reach AddOpen after a teardown has emptied the map. Without the latch that
+// handle is orphaned — nothing can ever close its descriptor or drop its
+// share-mode reservation.
 func (s *Session) TakeAllOpens() []*Open {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dead = true
 	out := make([]*Open, 0, len(s.opens))
 	for fid, o := range s.opens {
 		out = append(out, o)
@@ -279,11 +298,22 @@ func (s *Session) TreeCount() int {
 	return len(s.trees)
 }
 
-func (s *Session) AddOpen(o *Open) {
+// AddOpen registers a handle with the session.
+//
+// It reports false when the session has already been torn down (see
+// TakeAllOpens). A caller that gets false still owns the handle it built and
+// MUST release it — descriptor, share-mode reservation and anything else it
+// acquired — and answer the client STATUS_USER_SESSION_DELETED, because the
+// session the handle would have belonged to no longer exists.
+func (s *Session) AddOpen(o *Open) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dead {
+		return false
+	}
 	s.initTables()
 	s.opens[o.FileID] = o
+	return true
 }
 
 func (s *Session) GetOpen(id [16]byte) *Open {
@@ -326,12 +356,23 @@ const maxHalfOpenSessions = 64
 // the connection down, which is the right answer for a peer behaving this way.
 var ErrTooManyHalfOpenSessions = errors.New("too many unauthenticated sessions on one connection")
 
-// SessionTable is the parent's in-memory session map. One table is created per
-// TCP connection, so its counts are inherently per-connection.
+// SessionTable is one TCP connection's session map: the sessions the dispatcher
+// will serve on this connection, and the half-open cap that bounds an
+// unauthenticated peer. Its counts are inherently per-connection.
+//
+// It is deliberately NOT the server-wide view. A session must only be usable
+// from the connection that created it — Dispatch and the transform-header
+// decrypt both resolve a SessionId through this table — so making it shared
+// would let one connection drive another's sessions. The server-wide view lives
+// in SessionIndex, which exists for exactly one purpose (finding the session a
+// reconnecting client names in PreviousSessionId) and hands out no *Session to
+// a serving path.
+//
+// SessionIds themselves come from the process-wide allocSessionID, not from
+// this table, so an id names exactly one session across the whole server.
 type SessionTable struct {
-	mu     sync.Mutex
-	byID   map[uint64]*Session
-	nextID atomic.Uint64
+	mu   sync.Mutex
+	byID map[uint64]*Session
 	// halfOpen holds the ids of sessions created for an NTLM handshake that
 	// has not completed. Membership is tracked here rather than by scanning
 	// Session.Authenticated because that field is written by the read loop
@@ -341,16 +382,14 @@ type SessionTable struct {
 }
 
 func NewSessionTable() *SessionTable {
-	t := &SessionTable{
+	return &SessionTable{
 		byID:     make(map[uint64]*Session),
 		halfOpen: make(map[uint64]struct{}),
 	}
-	t.nextID.Store(1)
-	return t
 }
 
 func (t *SessionTable) New() *Session {
-	id := t.nextID.Add(1)
+	id := allocSessionID()
 	s := &Session{ID: id}
 	t.mu.Lock()
 	t.byID[id] = s
@@ -367,7 +406,7 @@ func (t *SessionTable) NewHalfOpen() (*Session, error) {
 	if len(t.halfOpen) >= maxHalfOpenSessions {
 		return nil, fmt.Errorf("%w (limit %d)", ErrTooManyHalfOpenSessions, maxHalfOpenSessions)
 	}
-	id := t.nextID.Add(1)
+	id := allocSessionID()
 	s := &Session{ID: id}
 	t.byID[id] = s
 	t.halfOpen[id] = struct{}{}
@@ -433,13 +472,22 @@ type SessionSetupHandler struct {
 	// request is denied.
 	RequireEncryption bool
 
-	// ClosePreviousSession releases everything a session owns — byte-range
-	// locks, descriptors, durable-table entries and outstanding CHANGE_NOTIFY
-	// watches — when a reconnecting client supersedes it via PreviousSessionId.
-	// ServeConn wires this to the dispatcher's releaseOpens; when it is nil the
-	// superseded session is still dropped from the table (its SessionId stops
-	// working) but its handles are left to the connection teardown.
-	ClosePreviousSession func(*Session)
+	// Index is the server-scoped session index. Every session this handler
+	// authenticates is registered in it under Host, and a reconnecting client's
+	// PreviousSessionId is resolved through it — which is what lets a session
+	// living on a DIFFERENT TCP connection be found and closed.
+	//
+	// When it is nil nothing is registered and PreviousSessionId can never
+	// match, so the reconnect degrades to "the old session is left to the idle
+	// reaper". ServeConn never leaves it nil: it falls back to an index of its
+	// own, which reduces the scope to this one connection but keeps the
+	// behaviour.
+	Index *SessionIndex
+
+	// Host identifies this connection to the index: the session table whose
+	// SessionId must be invalidated, and the dispatcher that owns the resume
+	// keys, notify registrations and durable entries of anything released.
+	Host *sessionHost
 }
 
 // hasGuestShare reports whether any configured share allows anonymous access.
@@ -500,14 +548,14 @@ func (h *SessionSetupHandler) HandleSessionSetup(rw io.ReadWriter, hdr smb2.Head
 	case ntlm.MessageTypeNegotiate:
 		return h.handleType1(rw, hdr, ntlmMsg, fullRequestFrame)
 	case ntlm.MessageTypeAuthenticate:
-		sess, err := h.handleType3(rw, hdr, ntlmMsg, fullRequestFrame)
-		if err == nil && sess != nil {
-			// Only once the client has proved who it is: closing the previous
-			// session is a teardown an unauthenticated peer must never be able
-			// to trigger by naming someone else's SessionId.
-			h.closePreviousSession(req.PreviousSessionID, sess)
-		}
-		return sess, err
+		// PreviousSessionId is honoured inside handleType3, between the point
+		// where the client has proved who it is and the point where it is told
+		// the session is up. Both halves of that matter: closing a session is a
+		// teardown an unauthenticated peer must never be able to trigger by
+		// naming someone else's SessionId, and a client told "you are set up"
+		// must not be able to re-open its files before the old session has let
+		// go of them — which is the whole point of MS-SMB2 §3.3.5.5.3.
+		return h.handleType3(rw, hdr, ntlmMsg, fullRequestFrame, req.PreviousSessionID)
 	default:
 		return nil, fmt.Errorf("unexpected NTLM message type 0x%x", msgType)
 	}
@@ -517,47 +565,27 @@ func (h *SessionSetupHandler) HandleSessionSetup(rw io.ReadWriter, hdr smb2.Head
 // §3.3.5.5.3: a client that reconnects because its own side of the old session
 // broke names that session's id, and the server must close it.
 //
-// Without this the old session's descriptors, byte-range locks and
-// change-notify watches survive until the idle reaper runs — and the stale
-// locks block the very client that just reconnected.
+// Without this the old session's descriptors, byte-range locks, share-mode
+// reservations, server-side-copy resume keys and change-notify watches survive
+// until the idle reaper runs — and those stale reservations block the very
+// client that just reconnected.
 //
-// Scope, deliberately: SessionTable is per connection (one NewSessionTable per
-// ServeConn), so only a previous session on *this* connection can be found.
-// That is the case where the server still believes the old session is alive on
-// a connection that is provably usable, and it is the reconnect leg a client
-// re-authenticating over a surviving TCP connection sends. A previous session
-// on a different connection cannot be looked up at all without a
-// server-scoped session index, which is a larger change than this defect
-// warrants; see .status.md.
+// The lookup goes through the server-scoped index, so the previous session is
+// found whether it lives on this connection or on another one. The
+// cross-connection case is the common one and the one macOS actually hits: the
+// client's own side breaks and it reconnects on a fresh TCP connection while
+// the server still believes the old one is alive. SessionIndex.supersede does
+// the identity check, removes the entry and drives the teardown on the
+// connection that owns the session.
 //
-// The match is on the authenticated user, as the spec requires: naming someone
-// else's SessionId must not close their session.
+// A zero id, the current session's own id, an id nobody holds and an id owned
+// by someone else are all silent no-ops: SESSION_SETUP must still succeed.
 func (h *SessionSetupHandler) closePreviousSession(prevID uint64, sess *Session) {
-	if prevID == 0 || sess == nil || h.Sessions == nil || prevID == sess.ID {
-		return
+	var guid [16]byte
+	if h.Conn != nil {
+		guid = h.Conn.ClientGuid
 	}
-	prev := h.Sessions.Get(prevID)
-	if prev == nil {
-		return
-	}
-	if !prev.Authenticated || prev.IsGuest != sess.IsGuest ||
-		!strings.EqualFold(prev.User.Name, sess.User.Name) {
-		if h.Log != nil {
-			h.Log.Warn("ignoring PreviousSessionId naming a session owned by someone else",
-				"previous_session_id", prevID, "session_id", sess.ID)
-		}
-		return
-	}
-	// ClosePreviousSession owns the descriptors, locks and notify watches; the
-	// table entry goes either way so the old SessionId stops being usable.
-	if h.ClosePreviousSession != nil {
-		h.ClosePreviousSession(prev)
-	}
-	h.Sessions.Remove(prevID)
-	if h.Log != nil {
-		h.Log.Info("closed previous session on reconnect",
-			"previous_session_id", prevID, "session_id", sess.ID, "smb_user", sess.User.Name)
-	}
+	h.Index.supersede(prevID, sess, guid, h.Log)
 }
 
 func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, type1, requestFrame []byte) (*Session, error) {
@@ -631,7 +659,7 @@ func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, typ
 	return nil, nil
 }
 
-func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, type3, requestFrame []byte) (*Session, error) {
+func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, type3, requestFrame []byte, prevSessionID uint64) (*Session, error) {
 	sess := h.Sessions.Get(hdr.SessionID)
 	if sess == nil {
 		return nil, fmt.Errorf("unknown session id %d", hdr.SessionID)
@@ -735,6 +763,20 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 	h.Sessions.MarkAuthenticated(sess.ID)
 	sess.ntlmNegotiate = nil
 	sess.ntlmChallenge = nil
+	// The session now has a security context, so it can be named by a later
+	// reconnect's PreviousSessionId — and can be superseded by one. Registering
+	// only authenticated sessions is what makes a half-open session (which
+	// nobody owns yet) unclosable by anybody.
+	h.Index.register(sess, h.Host)
+
+	// Close the session this one is replacing, BEFORE the response goes out.
+	// The response is what tells the client its reconnect succeeded, and the
+	// next thing a reconnecting client does is re-open the files it had open —
+	// so anything still holding those files' share-mode reservations or
+	// byte-range locks when the response lands is a sharing violation the
+	// client sees for its own handles. Answering first and cleaning up
+	// afterwards leaves exactly the window this change exists to close.
+	h.closePreviousSession(prevSessionID, sess)
 
 	var sessFlags uint16
 	switch {

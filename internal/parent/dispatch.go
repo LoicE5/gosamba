@@ -33,6 +33,12 @@ type Dispatcher struct {
 	Shares   []config.ShareConfig
 	Log      *slog.Logger
 
+	// Index is the server-scoped session index (see sessionindex.go). The
+	// dispatcher needs it for exactly one thing: LOGOFF deletes a session, and
+	// an entry left behind would keep a dead SessionId reachable by a later
+	// reconnect's PreviousSessionId. Every other removal is the index's own.
+	Index *SessionIndex
+
 	// locks is the per-OS byte-range lock manager backing handleLock/handleClose.
 	locks *lockManager
 
@@ -534,6 +540,18 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 // most of what running frames in parallel just won. A pipe or stream handle is
 // served out of those mutable buffers instead of a descriptor, so it is
 // excluded from the shared case.
+//
+// The shared/exclusive decision is made from IsDir, IsPipe and IsStream alone,
+// never from open.File. Those three are set once when the handle is created and
+// never written again; open.File is not — a release nils it, under this very
+// lock. Testing it here, before the lock is taken, is a read of a mutable field
+// with no synchronization at all, and it races a teardown that is nilling it at
+// that instant. (It was also redundant: File is non-nil for exactly the handles
+// these three flags are false for.) Deciding from the immutable flags is what
+// makes open.File a field that is only ever read under this lock and only ever
+// written under it exclusively. A handle whose descriptor has already gone
+// takes the shared path and its handler finds File nil under the lock, which is
+// the ordinary "stale FileID" answer.
 func lockOpenForMessage(sess *Session, cmd smb2.Command, body []byte) func() {
 	off := fileIDOffsetInBody(cmd)
 	if off < 0 || len(body) < off+16 {
@@ -544,7 +562,7 @@ func lockOpenForMessage(sess *Session, cmd smb2.Command, body []byte) func() {
 		return nil
 	}
 	if (cmd == smb2.CommandRead || cmd == smb2.CommandWrite) &&
-		open.File != nil && !open.IsPipe && !open.IsStream {
+		!open.IsDir && !open.IsPipe && !open.IsStream {
 		open.mu.RLock()
 		return open.mu.RUnlock
 	}
@@ -774,14 +792,32 @@ func visibleShares(all []config.ShareConfig, sess *Session) []config.ShareConfig
 // releaseOpens closes a batch of handles: byte-range locks first, then the
 // descriptor, and finally the durable-table entry so a disconnected tree or
 // session cannot be reclaimed and does not pin an fd.
+//
+// Every caller reached these handles by removing them from their Session's
+// opens map, which is what makes this run exactly once per handle — see the
+// ownership rule on sessionHost.closeSession. Nothing here is a "release if
+// still held" check, and nothing here may be skipped: a share-mode reservation
+// nobody releases makes the file permanently unopenable by every client.
+//
+// Each handle is held exclusively for its own release. Open.mu is the lock the
+// dispatcher takes for the length of every message naming that handle
+// (lockOpenForMessage), so taking it here is how a release waits for an
+// in-flight READ, WRITE or QUERY_DIRECTORY to finish before the descriptor
+// behind it is closed. That matters most for a cross-connection teardown, where
+// the requests still in flight belong to a different connection's worker pool
+// and there is no drain to wait on.
 func (d *Dispatcher) releaseOpens(opens []*Open) {
-	// Complete any CHANGE_NOTIFY still watching these handles first, so the
-	// client gets STATUS_NOTIFY_CLEANUP rather than waiting on a dead handle.
+	// Complete any CHANGE_NOTIFY or parked blocking LOCK still registered
+	// against these handles FIRST, for two reasons: the client gets
+	// STATUS_NOTIFY_CLEANUP rather than waiting on a dead handle, and a parked
+	// request is woken before this loop asks for its handle — a blocking LOCK
+	// retries under Open.mu, so waking it is what keeps the wait below short.
 	d.cancelNotifiesForOpens(opens)
 	for _, o := range opens {
 		if o == nil {
 			continue
 		}
+		unlock := lockOpenForRelease(o)
 		// A server-side-copy resume key is a capability naming this handle; it
 		// must not outlive it on any teardown path.
 		if d.Conn != nil {
@@ -802,7 +838,39 @@ func (d *Dispatcher) releaseOpens(opens []*Open) {
 			o.File.Close()
 			o.File = nil
 		}
+		unlock()
 	}
+}
+
+// lockOpenForRelease takes o's per-handle lock so the release that follows does
+// not run underneath a request still using the descriptor, and returns the
+// matching unlock.
+//
+// The wait is unbounded on purpose, and that is safe because nothing ever holds
+// Open.mu across an unbounded wait. The dispatcher holds it for the length of
+// one message; the two commands that would park — CHANGE_NOTIFY and a blocking
+// LOCK — register their wait and return, so neither holds it while parked
+// (releaseOpens wakes both before it reaches this loop anyway); and no handler
+// ever waits on the socket, which belongs to the writer goroutine. So the
+// longest this can wait is one message's worth of file I/O.
+//
+// A bounded wait was tried and removed. Giving up and releasing anyway means
+// writing o.File while a reader may still be in the handler — a data race the
+// detector finds, on the one field whose whole safety argument is that it is
+// written only under this lock. Giving up and NOT releasing leaks the
+// descriptor, the byte-range locks and the share-mode reservation, and a leaked
+// reservation makes the file unopenable by every client on every connection for
+// the life of the process. Neither is better than waiting for an I/O that is
+// going to finish.
+//
+// No caller may already hold this lock: releaseOpens is reached only from
+// TREE_DISCONNECT, LOGOFF and a session teardown, none of which carries a
+// FileID, so lockOpenForMessage took nothing; releaseConnOpens runs after the
+// pool has drained. Each handle appears once in a release batch, because the
+// batch came out of a map.
+func lockOpenForRelease(o *Open) func() {
+	o.mu.Lock()
+	return o.mu.Unlock
 }
 
 func (d *Dispatcher) handleTreeDisconnect(rw io.ReadWriter, hdr smb2.Header, body []byte, sess *Session) bool {
@@ -826,6 +894,10 @@ func (d *Dispatcher) handleLogoff(rw io.ReadWriter, hdr smb2.Header, sess *Sessi
 	if d.Sessions != nil {
 		d.Sessions.Remove(sess.ID)
 	}
+	// And out of the server-scoped index, or a later reconnect naming this id
+	// in PreviousSessionId would find a session that no longer exists on any
+	// connection — and the entry would outlive the server's memory of it.
+	d.Index.unregister(sess.ID)
 	return true
 }
 
@@ -888,7 +960,18 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 				d.respondError(rw, hdr, smb2.StatusInternalError, sess)
 				return true
 			}
-			sess.AddOpen(open)
+			// Held for the same reason as the file arm below: once AddOpen
+			// returns, a teardown can claim this handle, and the response is
+			// still being built out of it.
+			open.mu.Lock()
+			defer open.mu.Unlock()
+			if !sess.AddOpen(open) {
+				// The session was torn down under this CREATE. A pipe handle
+				// holds no descriptor and no reservation, so there is nothing
+				// to give back — just tell the client its session is gone.
+				d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)
+				return true
+			}
 			d.LastCreatedFileID = open.FileID
 			d.HasLastCreated = true
 			now := filetimeFromTime(time.Now())
@@ -1304,7 +1387,42 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 			return true
 		}
 	}
-	sess.AddOpen(open)
+	// Hold the handle from the instant before it becomes reachable until this
+	// CREATE has finished building its response out of it.
+	//
+	// AddOpen is the publication point: the moment it returns, the handle is in
+	// the session's map and a teardown on any connection can claim it and
+	// release it. Everything below still uses it — it fstats open.File for the
+	// QFid response, and applyDurableAndLease writes IsDurable and the durable
+	// GUIDs onto it — so without this the release's "o.File = nil" races this
+	// function's own reads, and its IsDurable write races the release's read of
+	// the same field. Open.mu is the lock releaseOpens takes per handle, so
+	// holding it here makes a teardown wait for this CREATE to finish rather
+	// than dismantle the handle half-way through it.
+	//
+	// The lock is taken BEFORE AddOpen, not after, so there is no instant in
+	// which the handle is reachable and unheld. Nothing else can be holding it:
+	// this Open was allocated a few lines ago and no other goroutine has ever
+	// seen it.
+	open.mu.Lock()
+	defer open.mu.Unlock()
+	if !sess.AddOpen(open) {
+		// The session was torn down while this CREATE was running — a LOGOFF,
+		// the connection dropping, or a reconnect on another connection naming
+		// it in PreviousSessionId. Everything acquired above belongs to nobody
+		// now: the handle is not in any session's map, so no CLOSE, no
+		// TREE_DISCONNECT and no teardown will ever reach it. Give it all back
+		// here or the descriptor and the share-mode reservation are held for
+		// the life of the process, and a leaked reservation makes the file
+		// unopenable by every client. The durable registration happens below
+		// this point, so there is no durable entry to retire.
+		d.Log.Warn("session torn down under an in-flight CREATE; releasing the handle",
+			"path", osPath, "session_id", hdr.SessionID)
+		releaseOpen(open)
+		open.File = nil
+		d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)
+		return true
+	}
 
 	d.LastCreatedFileID = open.FileID
 	d.HasLastCreated = true

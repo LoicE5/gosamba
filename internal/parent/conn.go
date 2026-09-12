@@ -67,6 +67,17 @@ type ConnOptions struct {
 	// DurableTimeout caps how long a reclaimed handle stays alive.
 	DurableTimeout time.Duration
 
+	// Sessions is the server-scoped session index, created once alongside
+	// Durable and shared across every ServeConn. It is what lets a client
+	// reconnecting on a NEW TCP connection name its old session in
+	// PreviousSessionId and have the server close it (MS-SMB2 §3.3.5.5.3).
+	//
+	// If nil, ServeConn makes one of its own, which narrows the reach of
+	// PreviousSessionId to this one connection but changes nothing else. That
+	// is the right degradation for the re-exec worker, where one process serves
+	// exactly one connection and there is no wider scope to have.
+	Sessions *SessionIndex
+
 	// OnAuthenticated, if non-nil, is invoked exactly once per session-setup
 	// that resolves a user (the first time the connection authenticates). The
 	// worker uses this hook to drop privileges to the authenticated user's
@@ -196,29 +207,53 @@ func releaseConnOpens(sessions *SessionTable, durable *DurableTable) {
 	if sessions == nil {
 		return
 	}
+	// Take the handles out of each session's map rather than iterating it in
+	// place. The map is the ownership token (see sessionHost.closeSession): a
+	// cross-connection teardown superseding one of these sessions right now
+	// calls TakeAllOpens too, and whichever of the two empties the map owns the
+	// release. Iterating without removing would let both release the same
+	// handle — a double close, and a share-mode reservation dropped twice.
+	var opens []*Open
 	sessions.RangeSessions(func(s *Session) {
-		s.RangeOpens(func(o *Open) {
-			if o.File == nil {
-				// No descriptor means no share-mode reservation either: only
-				// real file opens are ever registered (directories, named
-				// streams and IPC$ pipes are exempt), so there is nothing to
-				// release here.
-				return
-			}
-			if o.IsDurable && durable != nil &&
-				durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
-				durable.Detach(o.DurableClientGuid, o.DurableCreateGuid)
-				return
-			}
-			// This handle is gone for good.
-			sharedShareModes.release(o)
-			// Release any byte-range locks this open held before the fd
-			// closes: releaseAll's keyFor does an Fstat on the fd, which
-			// fails (and silently no-ops) once the file is closed.
-			sharedLockManager.releaseAll(o)
-			o.File.Close()
-		})
+		opens = append(opens, s.TakeAllOpens()...)
 	})
+	for _, o := range opens {
+		if o == nil {
+			continue
+		}
+		// The pool is drained by the time this runs, so no request is in
+		// flight — but an async goroutine (a blocking LOCK retrying under
+		// Open.mu) can still be winding down, and a cross-connection teardown
+		// may be releasing a sibling handle. Hold the handle for its release
+		// for the same reason releaseOpens does.
+		//
+		// The descriptor test is INSIDE the hold on purpose. o.File is written
+		// by a release, under this lock; testing it before taking the lock is
+		// the anti-pattern lockOpenForMessage had to be fixed for. It is not
+		// worth a subtle argument about why this particular one would be safe.
+		unlock := lockOpenForRelease(o)
+		if o.File == nil {
+			// No descriptor means no share-mode reservation either: only real
+			// file opens are ever registered (directories, named streams and
+			// IPC$ pipes are exempt), so there is nothing to release here.
+			unlock()
+			continue
+		}
+		if o.IsDurable && durable != nil &&
+			durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
+			durable.Detach(o.DurableClientGuid, o.DurableCreateGuid)
+			unlock()
+			continue
+		}
+		// This handle is gone for good.
+		sharedShareModes.release(o)
+		// Release any byte-range locks this open held before the fd
+		// closes: releaseAll's keyFor does an Fstat on the fd, which
+		// fails (and silently no-ops) once the file is closed.
+		sharedLockManager.releaseAll(o)
+		o.File.Close()
+		unlock()
+	}
 }
 
 // ServeConn drives one TCP connection through SMB2 NEGOTIATE → SESSION_SETUP.
@@ -301,14 +336,31 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 	}
 
 	sessions := NewSessionTable()
+	// The server-scoped session index. A nil one means nobody handed this
+	// connection a wider scope (the re-exec worker, or a test driving ServeConn
+	// directly), and a private index then keeps PreviousSessionId working
+	// within this connection instead of not at all.
+	index := opts.Sessions
+	if index == nil {
+		index = NewSessionIndex()
+	}
 	// dispatcher is assigned just below; the teardown closure needs to see it,
-	// so it is declared before the defer that references it.
+	// so it is declared before the defer that references it. host is the
+	// connection's identity in the index, and carries the dispatcher, so it is
+	// filled in after both exist.
 	var dispatcher *Dispatcher
+	host := &sessionHost{sessions: sessions, conn: conn, log: log}
 	// On connection drop, close every file descriptor that is NOT held by a
 	// live durable-table entry. Durable opens must stay alive so the client can
 	// reconnect and reclaim them; ordinary (non-durable) opens must be closed
 	// to release kernel fds.
 	defer func() {
+		// Leave the server-scoped index first. From here on this connection can
+		// serve nothing, so an entry still pointing at it could only send a
+		// reconnect's teardown into a connection that is already disposing of
+		// the same handles. Both paths are safe against each other (the session
+		// map decides who releases what), but the narrower window is free.
+		index.unregisterHost(host)
 		// Wait for every frame still executing. Disposing of handles below
 		// closes descriptors those frames are reading and writing through.
 		pool.drain()
@@ -334,6 +386,8 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		Shares:            opts.Shares,
 		Log:               log,
 		RequireEncryption: opts.RequireEncryption,
+		Index:             index,
+		Host:              host,
 	}
 	dispatcher = &Dispatcher{
 		Conn:              conn,
@@ -345,14 +399,14 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		RequireSigning:    opts.RequireSigning,
 		out:               writer,
 		async:             &asyncTable{},
+		Index:             index,
 	}
-	// A reconnecting client names the session it is replacing in
-	// PreviousSessionId; tearing that session's handles down is the same work
-	// LOGOFF does, so it runs through the dispatcher (which also cancels its
-	// CHANGE_NOTIFY watches and releases its byte-range locks).
-	ssHandler.ClosePreviousSession = func(prev *Session) {
-		dispatcher.releaseOpens(prev.TakeAllOpens())
-	}
+	// Tearing a session down is the same work LOGOFF does, so it runs through
+	// this connection's dispatcher — which is what makes the resume keys, the
+	// CHANGE_NOTIFY registrations and the durable entries that get released the
+	// ones belonging to the connection that owns the session, even when the
+	// teardown was ordered by a different connection's SESSION_SETUP.
+	host.disp = dispatcher
 
 	// serveFrame executes one inbound frame's chain and sends its responses.
 	// It reports false when the connection must be dropped.

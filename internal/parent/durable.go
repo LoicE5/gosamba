@@ -626,7 +626,25 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	sharedShareModes.transfer(saved, open)
 	reclaimed = true
 
-	sess.AddOpen(open)
+	// Held from before publication until the response is built; see the
+	// equivalent comment in handleCreate. This path writes open.IsDurable after
+	// AddOpen, which a concurrent release reads, and reads open.File to build
+	// the response.
+	open.mu.Lock()
+	defer open.mu.Unlock()
+	if !sess.AddOpen(open) {
+		// The session went away while the reclaim was running. The reclaim has
+		// already consumed the durable entry and moved the saved handle's
+		// share-mode reservation onto this Open, so both are ours to give back
+		// — nothing else can reach this handle now. The re-registration below
+		// has not run, so there is no new durable entry either.
+		d.Log.Warn("session torn down under a durable reconnect; releasing the reclaimed handle",
+			"path", open.Path, "share", tree.Share.Name)
+		releaseOpen(open)
+		open.File = nil
+		d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)
+		return true
+	}
 	// Re-register so a subsequent drop can reclaim again. The reclaim above
 	// removed the entry, so the slot is normally free; it can only be taken
 	// again if a racing connection registered the same CreateGuid in between.

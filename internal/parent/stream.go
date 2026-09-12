@@ -229,7 +229,20 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		d.respondError(rw, hdr, smb2.StatusInternalError, sess)
 		return true
 	}
-	sess.AddOpen(open)
+	// Held from before publication until the response is built; see the
+	// equivalent comment in handleCreate. A stream handle's response is built
+	// out of open.streamBuf, which a teardown does not touch — but the handle
+	// still has to be unreachable-or-held, never reachable-and-unheld, or the
+	// rule stops being checkable.
+	open.mu.Lock()
+	defer open.mu.Unlock()
+	if !sess.AddOpen(open) {
+		// Torn down under this CREATE. A stream handle is an in-memory buffer
+		// with no descriptor and no share-mode reservation (shareModeApplies
+		// excludes streams), so nothing has to be given back.
+		d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)
+		return true
+	}
 	d.LastCreatedFileID = open.FileID
 	d.HasLastCreated = true
 

@@ -3168,6 +3168,26 @@ func (d *Dispatcher) handleChangeNotify(rw io.ReadWriter, hdr smb2.Header, body 
 	}
 	open := sess.GetOpen(req.FileID)
 	if open == nil || !open.IsDir {
+		// macOS treats this server as an OS X server (we answer the AAPL
+		// server-query context) and then starts a "server message"
+		// CHANGE_NOTIFY whose FileId is the all-FF sentinel — a Mac-to-Mac
+		// side channel we do not implement. That request is NOT part of a
+		// related compound chain, so the substitution above never runs and no
+		// handle can ever match. Answering STATUS_INVALID_PARAMETER maps to
+		// EINVAL, which Apple's client retries until its received-notify
+		// counter passes SMBFS_MAX_RCVD_NOTIFY (4) — five wasted round-trips
+		// per mount plus a logged warning. STATUS_NOT_SUPPORTED maps to
+		// ENOTSUP, which process_svrmsg_items() turns into a clean one-shot
+		// "svrmsg notify not supported" shutdown of the watch.
+		//
+		// Only the unrelated sentinel changes: inside a related chain the
+		// all-FF FileId means "the previous CREATE's handle" and must keep
+		// its existing error so a broken compound chain is still diagnosed
+		// as such.
+		if open == nil && hdr.Flags&smb2.FlagRelatedOps == 0 && req.FileID == previousHandleFileID {
+			d.respondError(rw, hdr, smb2.StatusNotSupported, sess)
+			return true
+		}
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}

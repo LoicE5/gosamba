@@ -71,9 +71,10 @@ func TestFix_SvrMsgNotifySentinelDeclinedAsNotSupported(t *testing.T) {
 			uint32(got), uint32(smb2.StatusNotSupported))
 	}
 	// Nothing may be left watching: the request was declined outright.
-	d.notifyMu.Lock()
-	n := len(d.notifies)
-	d.notifyMu.Unlock()
+	at := d.asyncTable()
+	at.mu.Lock()
+	n := len(at.regs)
+	at.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("declined svrmsg notify left %d registration(s) behind", n)
 	}

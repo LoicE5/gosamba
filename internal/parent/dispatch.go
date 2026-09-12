@@ -44,8 +44,32 @@ type Dispatcher struct {
 	RequireEncryption bool
 	RequireSigning    bool
 
-	// Chain state — set by handleCreate, consumed by the ServeConn loop
-	// to satisfy "previous handle" FileIDs in compound related ops.
+	// --- connection-scoped, shared by every per-frame clone ---
+
+	// out is the connection's writer goroutine. Every response is handed to it
+	// rather than written inline, so no handler ever waits on the socket. It is
+	// nil for a Dispatcher built directly (unit tests drive one handler against
+	// a plain buffer), in which case responses are written to the io.Writer the
+	// handler was given.
+	out *connWriter
+
+	// async is the connection's table of outstanding async requests
+	// (CHANGE_NOTIFY and blocking LOCK). Each entry lets CLOSE /
+	// TREE_DISCONNECT / LOGOFF complete a pending request (MS-SMB2 §3.3.5.19
+	// requires STATUS_NOTIFY_CLEANUP rather than leaving the client waiting
+	// forever) and lets SMB2_CANCEL finish the original request instead of
+	// being answered with a second response.
+	//
+	// It is a pointer because ServeConn clones the Dispatcher per inbound
+	// frame: the chain state below is per-frame, but this table must stay
+	// shared across every frame on the connection.
+	async *asyncTable
+
+	// --- per-frame: fresh in every clone forFrame returns ---
+
+	// LastCreatedFileID / HasLastCreated are set by handleCreate and consumed
+	// by the chain loop to satisfy "previous handle" FileIDs in compound
+	// related ops.
 	LastCreatedFileID [16]byte
 	HasLastCreated    bool
 
@@ -55,31 +79,22 @@ type Dispatcher struct {
 	// (MS-SMB2 §3.3.5.2.7).
 	lastChainStatus smb2.Status
 
-	// encryptChain is set by ServeConn when the inbound frame arrived
-	// inside an SMB3 transform header. All responses for this chain go
-	// back encrypted. It is read by the CHANGE_NOTIFY async goroutine (via
-	// writeFrame) while ServeConn sets it for the next chain, so it is atomic.
-	encryptChain atomic.Bool
+	// encryptChain records that this frame arrived inside an SMB3 transform
+	// header, so every response to it goes back encrypted. forFrame sets it
+	// once and nothing writes it afterwards, which is what lets the async
+	// completion goroutines read it without synchronization.
+	encryptChain bool
 
-	// writeMu serializes writes to the connection so async goroutines
-	// (CHANGE_NOTIFY completion) don't corrupt frames the main dispatcher
-	// is sending.
-	writeMu sync.Mutex
-
-	// notifyMu guards notifies, the table of outstanding CHANGE_NOTIFY
-	// requests. Each entry lets CLOSE / TREE_DISCONNECT / LOGOFF complete a
-	// pending notify (MS-SMB2 §3.3.5.19 requires STATUS_NOTIFY_CLEANUP rather
-	// than leaving the client waiting forever) and lets SMB2_CANCEL finish the
-	// original request instead of being answered with a second response.
-	notifyMu sync.Mutex
-	notifies map[uint64]*notifyReg
-	// nextAsyncID allocates AsyncIds for STATUS_PENDING responses.
-	nextAsyncID atomic.Uint64
+	// pending buffers this frame's responses so the members of a compound
+	// request can go back as one compounded frame. It is nil for a Dispatcher
+	// that is not running a chain, and responses then go straight out.
+	pending *pendingResponses
 }
 
-// notifyReg is one outstanding CHANGE_NOTIFY request. cancel is closed exactly
-// once (guarded by the dispatcher's notifyMu) to wake the watching goroutine;
-// status carries the completion the canceller wants the client to see.
+// notifyReg is one outstanding async request — a CHANGE_NOTIFY watch or a
+// parked blocking LOCK. cancel is closed exactly once (guarded by the async
+// table's mutex) to wake the waiting goroutine; status carries the completion
+// the canceller wants the client to see.
 type notifyReg struct {
 	open      *Open
 	cancel    chan struct{}
@@ -87,28 +102,94 @@ type notifyReg struct {
 	cancelled bool
 }
 
-// registerNotify records an outstanding notify keyed by its MessageId.
-func (d *Dispatcher) registerNotify(msgID uint64, reg *notifyReg) {
-	d.notifyMu.Lock()
-	defer d.notifyMu.Unlock()
-	if d.notifies == nil {
-		d.notifies = make(map[uint64]*notifyReg)
+// maxPreCancelled bounds the set of MessageIds an SMB2_CANCEL named before the
+// request it cancels had registered. A client cannot grow it without bound by
+// cancelling ids it never used.
+const maxPreCancelled = 256
+
+// asyncTable is one connection's outstanding async requests, keyed by the
+// MessageId of the request that created them.
+type asyncTable struct {
+	mu   sync.Mutex
+	regs map[uint64]*notifyReg
+
+	// preCancelled remembers cancels that arrived before their request did.
+	//
+	// Frames are dispatched concurrently, so an SMB2_CANCEL can overtake the
+	// CHANGE_NOTIFY or blocking LOCK it names. Dropping it there would leave
+	// the client waiting on a request it has already given up on, so the id is
+	// held until the request registers and is then cancelled immediately.
+	preCancelled map[uint64]smb2.Status
+
+	// nextID allocates AsyncIds for STATUS_PENDING responses. It is
+	// connection-scoped: an AsyncId identifies one outstanding request to the
+	// client, so per-frame counters would collide.
+	nextID atomic.Uint64
+}
+
+// asyncTable returns the connection-scoped table, creating it on first use.
+//
+// ServeConn installs one before any frame is dispatched, so the lazy path is
+// reached only by a Dispatcher built as a bare struct literal (unit tests
+// driving a single handler), where the first touch is the synchronous
+// registerNotify that precedes the goroutine it is registering for.
+func (d *Dispatcher) asyncTable() *asyncTable {
+	if d.async == nil {
+		d.async = &asyncTable{}
 	}
-	d.notifies[msgID] = reg
+	return d.async
+}
+
+// nextAsyncID allocates an AsyncId for an interim STATUS_PENDING response.
+func (d *Dispatcher) nextAsyncID() uint64 { return d.asyncTable().nextID.Add(1) }
+
+// registerNotify records an outstanding async request keyed by its MessageId.
+// A cancel that arrived first is applied at once.
+func (d *Dispatcher) registerNotify(msgID uint64, reg *notifyReg) {
+	t := d.asyncTable()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if status, ok := t.preCancelled[msgID]; ok {
+		delete(t.preCancelled, msgID)
+		reg.cancelled = true
+		reg.status = status
+		close(reg.cancel)
+		return
+	}
+	if t.regs == nil {
+		t.regs = make(map[uint64]*notifyReg)
+	}
+	t.regs[msgID] = reg
 }
 
 func (d *Dispatcher) unregisterNotify(msgID uint64) {
-	d.notifyMu.Lock()
-	defer d.notifyMu.Unlock()
-	delete(d.notifies, msgID)
+	if d.async == nil {
+		return
+	}
+	d.async.mu.Lock()
+	defer d.async.mu.Unlock()
+	delete(d.async.regs, msgID)
 }
 
-// cancelNotify completes one outstanding notify with the given status.
+// cancelNotify completes one outstanding request with the given status. It
+// reports false when there is nothing (yet) to cancel.
 func (d *Dispatcher) cancelNotify(msgID uint64, status smb2.Status) bool {
-	d.notifyMu.Lock()
-	defer d.notifyMu.Unlock()
-	reg, ok := d.notifies[msgID]
-	if !ok || reg.cancelled {
+	t := d.asyncTable()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	reg, ok := t.regs[msgID]
+	if !ok {
+		// The request has not registered yet — its frame may still be waiting
+		// for a worker. Remember the cancel so registerNotify can apply it.
+		if len(t.preCancelled) < maxPreCancelled {
+			if t.preCancelled == nil {
+				t.preCancelled = make(map[uint64]smb2.Status)
+			}
+			t.preCancelled[msgID] = status
+		}
+		return false
+	}
+	if reg.cancelled {
 		return false
 	}
 	reg.cancelled = true
@@ -117,20 +198,20 @@ func (d *Dispatcher) cancelNotify(msgID uint64, status smb2.Status) bool {
 	return true
 }
 
-// cancelNotifiesForOpens completes every notify registered against any of the
+// cancelNotifiesForOpens completes every request registered against any of the
 // given handles. Called when those handles go away so the client is not left
 // waiting on a watch whose directory handle no longer exists.
 func (d *Dispatcher) cancelNotifiesForOpens(opens []*Open) {
-	if len(opens) == 0 {
+	if len(opens) == 0 || d.async == nil {
 		return
 	}
 	set := make(map[*Open]struct{}, len(opens))
 	for _, o := range opens {
 		set[o] = struct{}{}
 	}
-	d.notifyMu.Lock()
-	defer d.notifyMu.Unlock()
-	for _, reg := range d.notifies {
+	d.async.mu.Lock()
+	defer d.async.mu.Unlock()
+	for _, reg := range d.async.regs {
 		if reg.cancelled {
 			continue
 		}
@@ -143,14 +224,28 @@ func (d *Dispatcher) cancelNotifiesForOpens(opens []*Open) {
 	}
 }
 
-// CancelAllNotifies completes every outstanding notify on this connection. It
-// is called during connection teardown: the watcher goroutines block until an
-// event or a cancel, so without this each abandoned CHANGE_NOTIFY would leak a
-// goroutine and its watch descriptors for the life of the process.
+// notifyStatus reads the completion status a canceller left on reg under the
+// async table's lock, so the waiting goroutine does not race the cancel that
+// woke it.
+func (d *Dispatcher) notifyStatus(reg *notifyReg) smb2.Status {
+	t := d.asyncTable()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return reg.status
+}
+
+// CancelAllNotifies completes every outstanding async request on this
+// connection. It is called during connection teardown: the waiting goroutines
+// block until an event or a cancel, so without this each abandoned
+// CHANGE_NOTIFY would leak a goroutine and its watch descriptors for the life
+// of the process.
 func (d *Dispatcher) CancelAllNotifies() {
-	d.notifyMu.Lock()
-	defer d.notifyMu.Unlock()
-	for _, reg := range d.notifies {
+	if d.async == nil {
+		return
+	}
+	d.async.mu.Lock()
+	defer d.async.mu.Unlock()
+	for _, reg := range d.async.regs {
 		if reg.cancelled {
 			continue
 		}
@@ -208,11 +303,30 @@ func encryptionExempt(cmd smb2.Command) bool {
 	return false
 }
 
-// ResetChainState clears per-chain (per-TCP-frame) state.
-func (d *Dispatcher) ResetChainState() {
-	d.LastCreatedFileID = [16]byte{}
-	d.HasLastCreated = false
-	d.lastChainStatus = smb2.StatusSuccess
+// forFrame returns the Dispatcher to run one inbound frame's chain on.
+//
+// The connection-scoped fields — the session table, the async table, the
+// writer goroutine, the logger — are all pointers and stay shared. The
+// compound-chain state is fresh: the previous-handle FileID, the previous
+// member's status, whether this frame arrived encrypted, and the buffer its
+// responses accumulate in. That is what lets two frames execute concurrently
+// on the connection's worker pool without corrupting each other, which they
+// did while this state lived on the one shared Dispatcher.
+//
+// The copy is safe only because the Dispatcher holds no mutex or atomic of its
+// own; anything that must be shared lives behind one of its pointers.
+func (d *Dispatcher) forFrame(encrypted bool) *Dispatcher {
+	// Materialize the shared table before copying, so clones cannot each
+	// lazily create one of their own and lose track of each other's
+	// outstanding requests.
+	d.asyncTable()
+	f := *d
+	f.LastCreatedFileID = [16]byte{}
+	f.HasLastCreated = false
+	f.lastChainStatus = smb2.StatusSuccess
+	f.encryptChain = encrypted
+	f.pending = &pendingResponses{}
+	return &f
 }
 
 // hasPreviousHandleSentinel reports whether body's FileID slot holds the
@@ -223,25 +337,6 @@ func hasPreviousHandleSentinel(cmd smb2.Command, body []byte) bool {
 		return false
 	}
 	return [16]byte(body[off:off+16]) == previousHandleFileID
-}
-
-// SetEncryptForChain marks whether the current inbound chain was encrypted.
-func (d *Dispatcher) SetEncryptForChain(b bool) { d.encryptChain.Store(b) }
-
-// writeFrame serializes outbound frames and applies SMB3 transform-header
-// encryption when the session demands it (or when the client encrypted us).
-func (d *Dispatcher) writeFrame(rw io.Writer, sess *Session, frame []byte) error {
-	if sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted() || d.encryptChain.Load()) {
-		enc, err := smb3.EncryptTransform(uint16(d.Conn.Selection.Cipher), sess.S2CCipherKey, sess.ID, frame)
-		if err != nil {
-			return err
-		}
-		frame = enc
-	}
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-	return transport.WriteFrame(rw, frame)
 }
 
 // previousHandleFileID is the SMB2 sentinel meaning "use the FileID returned
@@ -303,7 +398,7 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 		return false
 	}
 
-	encrypted := d.encryptChain.Load()
+	encrypted := d.encryptChain
 
 	// Enforce the server's inbound security policy. Guests carry no session
 	// keys (they opted out of per-session crypto), so the requirements apply
@@ -356,6 +451,13 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 			return true
 		}
 		d.SubstitutePreviousHandleFileID(hdr.Command, body)
+	}
+
+	// Frames run concurrently, so two messages can now reach the same handle at
+	// once. Hold the handle for the length of this message; see
+	// lockOpenForMessage for why that is done here rather than per handler.
+	if unlock := lockOpenForMessage(sess, hdr.Command, body); unlock != nil {
+		defer unlock()
 	}
 
 	switch hdr.Command {
@@ -414,31 +516,64 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 	}
 }
 
-// respondSuccess writes a signed STATUS_SUCCESS response with the given body.
-func (d *Dispatcher) respondSuccess(rw io.ReadWriter, hdr smb2.Header, sess *Session, body []byte) {
-	// Don't sign if we're going to wrap in transform header — encryption
-	// already authenticates the frame, and signing under encryption is
-	// disallowed for the wrapped message (MS-SMB2 §3.3.4.1.4).
-	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted() || d.encryptChain.Load())
-	sign := !willEncrypt && sess != nil && len(sess.SigningKey) > 0
-	out := d.buildResponse(hdr, sess, smb2.StatusSuccess, body, sign)
+// lockOpenForMessage locks the handle a message names, for as long as that
+// message runs, and returns the matching unlock (nil when there is no handle).
+//
+// Until this connection served frames in parallel a handle could only be
+// touched by one request at a time, and its mutable state — the directory
+// enumeration cursor, a named stream's in-memory buffer, a pipe's queued
+// DCE/RPC response, the delete-on-close flag — was written with no lock at
+// all. Taking the handle's lock in the dispatcher restores exactly that
+// ordering for two requests on one handle while leaving requests on different
+// handles fully parallel, and does it in one place rather than in every
+// handler.
+//
+// READ and WRITE on an ordinary file handle take the lock shared: they
+// pread/pwrite at an explicit offset and touch no field of the Open, and they
+// are what a client pipelines hardest, so serializing them would give back
+// most of what running frames in parallel just won. A pipe or stream handle is
+// served out of those mutable buffers instead of a descriptor, so it is
+// excluded from the shared case.
+func lockOpenForMessage(sess *Session, cmd smb2.Command, body []byte) func() {
+	off := fileIDOffsetInBody(cmd)
+	if off < 0 || len(body) < off+16 {
+		return nil
+	}
+	open := sess.GetOpen([16]byte(body[off : off+16]))
+	if open == nil {
+		return nil
+	}
+	if (cmd == smb2.CommandRead || cmd == smb2.CommandWrite) &&
+		open.File != nil && !open.IsPipe && !open.IsStream {
+		open.mu.RLock()
+		return open.mu.RUnlock
+	}
+	open.mu.Lock()
+	return open.mu.Unlock
+}
+
+// respondSuccess emits a STATUS_SUCCESS response with the given body.
+func (d *Dispatcher) respondSuccess(rw io.Writer, hdr smb2.Header, sess *Session, body []byte) {
 	d.lastChainStatus = smb2.StatusSuccess
-	_ = d.writeFrame(rw, sess, out)
+	d.emit(rw, sess, d.buildResponse(hdr, smb2.StatusSuccess, body))
 }
 
-// respondError writes a signed error response with a small error body.
-func (d *Dispatcher) respondError(rw io.ReadWriter, hdr smb2.Header, status smb2.Status, sess *Session) {
+// respondError emits an error response with a small error body.
+func (d *Dispatcher) respondError(rw io.Writer, hdr smb2.Header, status smb2.Status, sess *Session) {
 	errBody := []byte{0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted() || d.encryptChain.Load())
-	signed := !willEncrypt && sess != nil && len(sess.SigningKey) > 0
-	out := d.buildResponse(hdr, sess, status, errBody, signed)
 	d.lastChainStatus = status
-	_ = d.writeFrame(rw, sess, out)
+	d.emit(rw, sess, d.buildResponse(hdr, status, errBody))
 }
 
-func (d *Dispatcher) buildResponse(reqHdr smb2.Header, sess *Session, status smb2.Status, body []byte, sign bool) []byte {
+// buildResponse encodes one sync response into a fresh buffer that reserves
+// transport.FrameHeaderSize bytes of NBSS headroom at the front, so a response
+// that ends up alone in its frame goes on the wire without being copied again.
+//
+// It deliberately does not sign. A member of a compounded response is signed
+// over its NextCommand field and its padding, and neither exists until the
+// shape of the whole frame is known; signing happens in sendCompound and
+// sealAndSend instead.
+func (d *Dispatcher) buildResponse(reqHdr smb2.Header, status smb2.Status, body []byte) []byte {
 	respHdr := smb2.Header{
 		CreditCharge:   reqHdr.CreditCharge,
 		Status:         uint32(status),
@@ -449,12 +584,10 @@ func (d *Dispatcher) buildResponse(reqHdr smb2.Header, sess *Session, status smb
 		TreeID:         reqHdr.TreeID,
 		SessionID:      reqHdr.SessionID,
 	}
-	out := make([]byte, smb2.HeaderSize+len(body))
-	_ = smb2.EncodeHeader(out[:smb2.HeaderSize], respHdr)
-	copy(out[smb2.HeaderSize:], body)
-	if sign && sess != nil {
-		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, out)
-	}
+	out := make([]byte, transport.FrameHeaderSize+smb2.HeaderSize+len(body))
+	msg := out[transport.FrameHeaderSize:]
+	_ = smb2.EncodeHeader(msg[:smb2.HeaderSize], respHdr)
+	copy(msg[smb2.HeaderSize:], body)
 	return out
 }
 
@@ -597,27 +730,10 @@ func (s syntheticDirEntry) Info() (os.FileInfo, error) {
 	return s.info, nil
 }
 
-func (d *Dispatcher) respondSuccessWithTreeID(rw io.ReadWriter, hdr smb2.Header, sess *Session, body []byte, treeID uint32) {
-	respHdr := smb2.Header{
-		CreditCharge:   hdr.CreditCharge,
-		Status:         uint32(smb2.StatusSuccess),
-		Command:        hdr.Command,
-		CreditResponse: grantCredits(hdr.CreditCharge, hdr.CreditResponse),
-		Flags:          smb2.FlagServerToRedir,
-		MessageID:      hdr.MessageID,
-		TreeID:         treeID,
-		SessionID:      hdr.SessionID,
-	}
-	out := make([]byte, smb2.HeaderSize+len(body))
-	_ = smb2.EncodeHeader(out[:smb2.HeaderSize], respHdr)
-	copy(out[smb2.HeaderSize:], body)
-	willEncrypt := len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted() || d.encryptChain.Load())
-	if !willEncrypt && len(sess.SigningKey) > 0 {
-		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, out)
-	}
+func (d *Dispatcher) respondSuccessWithTreeID(rw io.Writer, hdr smb2.Header, sess *Session, body []byte, treeID uint32) {
+	hdr.TreeID = treeID
 	d.lastChainStatus = smb2.StatusSuccess
-	_ = d.writeFrame(rw, sess, out)
+	d.emit(rw, sess, d.buildResponse(hdr, smb2.StatusSuccess, body))
 }
 
 func shareAllowed(u config.UserConfig, shareName string) bool {
@@ -1469,17 +1585,12 @@ const readResponseFixed = 16
 // second, prepend the header into a third, frame into a fourth) cost four
 // allocations and three payload-sized copies per response.
 //
-// The NBSS header is only reserved when the response will go out in cleartext.
-// An encrypted response is re-framed by smb3.EncryptTransform, which prepends
-// its own 52-byte transform header into a buffer of its own, so reserving the
-// four bytes here would just push a stale gap through the AEAD. In that case
-// the frame starts at the SMB2 header and sendReadResponseFrame hands it to
-// the ordinary writeFrame path.
+// The NBSS header is always reserved, even when the response will be
+// encrypted: the emit path slices the headroom off before handing the message
+// to smb3.EncryptTransform, so the four bytes never reach the AEAD, and
+// reserving them unconditionally keeps every response buffer the same shape.
 func (d *Dispatcher) newReadResponseFrame(sess *Session, n int) (buf, data []byte, prefix int) {
 	prefix = transport.FrameHeaderSize
-	if d.willEncryptResponse(sess) {
-		prefix = 0
-	}
 	buf = make([]byte, prefix+smb2.HeaderSize+readResponseFixed+n)
 	return buf, buf[prefix+smb2.HeaderSize+readResponseFixed:], prefix
 }
@@ -1514,17 +1625,7 @@ func (d *Dispatcher) sendReadResponseFrame(rw io.Writer, reqHdr smb2.Header, ses
 	binary.LittleEndian.PutUint32(body[4:], uint32(n))
 
 	d.lastChainStatus = smb2.StatusSuccess
-	if prefix == 0 {
-		// Encrypted: writeFrame wraps msg in a transform header and frames it.
-		_ = d.writeFrame(rw, sess, msg)
-		return
-	}
-	if sess != nil && len(sess.SigningKey) > 0 && d.Conn != nil {
-		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, msg)
-	}
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-	_ = transport.WritePreframed(rw, buf)
+	d.emit(rw, sess, buf)
 }
 
 // willEncryptResponse reports whether a response on this chain goes back
@@ -1534,7 +1635,7 @@ func (d *Dispatcher) sendReadResponseFrame(rw io.Writer, reqHdr smb2.Header, ses
 func (d *Dispatcher) willEncryptResponse(sess *Session) bool {
 	return sess != nil && len(sess.S2CCipherKey) > 0 &&
 		d.Conn != nil && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted() || d.encryptChain.Load())
+		(sess.GotEncrypted() || d.encryptChain)
 }
 
 // --- WRITE ---
@@ -2574,8 +2675,10 @@ func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit in
 // never needs more than seven.
 var dirRecordPadding [8]byte
 
-// padTo8 rounds n up to the next multiple of 8. Directory records are 8-byte
-// aligned, so a record's padded length is exactly its NextEntryOffset.
+// padTo8 rounds n up to the next multiple of 8. Both of SMB2's chained layouts
+// are 8-byte aligned, so a padded length is exactly the offset field that links
+// to the next element: NextEntryOffset for a directory record, NextCommand for
+// a member of a compounded response.
 func padTo8(n int) int {
 	if r := n % 8; r != 0 {
 		return n + 8 - r
@@ -3341,7 +3444,7 @@ func (d *Dispatcher) handleChangeNotify(rw io.ReadWriter, hdr smb2.Header, body 
 		return true
 	}
 
-	asyncID := d.nextAsyncID.Add(1)
+	asyncID := d.nextAsyncID()
 	watchTree := req.Flags&smb2.NotifyWatchTree != 0
 	filter := req.CompletionFilter
 	maxOut := req.OutputBufferLength
@@ -3418,9 +3521,7 @@ func (d *Dispatcher) handleChangeNotify(rw io.ReadWriter, hdr smb2.Header, body 
 		if cancelled && len(entries) == 0 {
 			// CLOSE/TREE_DISCONNECT/CANCEL completed us: answer the original
 			// request with a plain error frame, not a CHANGE_NOTIFY body.
-			d.notifyMu.Lock()
-			status := reg.status
-			d.notifyMu.Unlock()
+			status := d.notifyStatus(reg)
 			d.sendAsync(rw, hdr, sess, asyncID, status,
 				[]byte{0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 			return
@@ -3460,7 +3561,7 @@ func actionForEvent(t inotify.EventType) uint32 {
 // sendAsync builds and writes an SMB2 async-format response (FlagAsyncCommand
 // set, AsyncId in bytes 32-39 instead of TreeId/Reserved). The whole frame
 // is signed end-to-end like a sync response.
-func (d *Dispatcher) sendAsync(rw io.ReadWriter, reqHdr smb2.Header, sess *Session, asyncID uint64, status smb2.Status, body []byte) {
+func (d *Dispatcher) sendAsync(rw io.Writer, reqHdr smb2.Header, sess *Session, asyncID uint64, status smb2.Status, body []byte) {
 	respHdr := smb2.Header{
 		CreditCharge:   reqHdr.CreditCharge,
 		Status:         uint32(status),
@@ -3470,13 +3571,16 @@ func (d *Dispatcher) sendAsync(rw io.ReadWriter, reqHdr smb2.Header, sess *Sessi
 		MessageID:      reqHdr.MessageID,
 		SessionID:      reqHdr.SessionID,
 	}
-	out := make([]byte, smb2.HeaderSize+len(body))
-	_ = smb2.EncodeAsyncHeader(out[:smb2.HeaderSize], respHdr, asyncID)
-	copy(out[smb2.HeaderSize:], body)
-	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		sess.GotEncrypted()
-	if !willEncrypt && sess != nil && len(sess.SigningKey) > 0 {
-		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, out)
-	}
-	_ = d.writeFrame(rw, sess, out)
+	out := make([]byte, transport.FrameHeaderSize+smb2.HeaderSize+len(body))
+	msg := out[transport.FrameHeaderSize:]
+	_ = smb2.EncodeAsyncHeader(msg[:smb2.HeaderSize], respHdr, asyncID)
+	copy(msg[smb2.HeaderSize:], body)
+	// An async response never joins a compounded reply: the interim
+	// STATUS_PENDING goes out the instant the request is parked, and the
+	// completion comes from a goroutine long after the chain flushed. It is
+	// also not tied to the chain's encryption decision — by the time it is
+	// sent there is no chain — so only the session's own state applies.
+	encrypt := sess != nil && len(sess.S2CCipherKey) > 0 &&
+		d.Conn != nil && d.Conn.Selection.Cipher != 0 && sess.GotEncrypted()
+	_ = d.sealAndSend(rw, sess, out, encrypt)
 }

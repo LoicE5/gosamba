@@ -285,7 +285,7 @@ func (d *Dispatcher) startLockWait(rw io.ReadWriter, hdr smb2.Header, sess *Sess
 		d.Log.Warn("lock: too many pending blocking locks, failing immediately")
 		return false
 	}
-	asyncID := d.nextAsyncID.Add(1)
+	asyncID := d.nextAsyncID()
 	// Register in the same table CHANGE_NOTIFY uses, so SMB2_CANCEL, CLOSE,
 	// TREE_DISCONNECT, LOGOFF and connection teardown all complete this
 	// request instead of leaving the client waiting on a handle that is gone.

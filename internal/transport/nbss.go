@@ -91,6 +91,20 @@ func WriteFrame(w io.Writer, payload []byte) error {
 // The payload length is taken from len(buf), so buf must be exactly the frame:
 // slice it to length before calling.
 func WritePreframed(w io.Writer, buf []byte) error {
+	if err := PutFrameHeader(buf); err != nil {
+		return err
+	}
+	_, err := w.Write(buf)
+	return err
+}
+
+// PutFrameHeader fills buf's first FrameHeaderSize bytes with the NBSS
+// SESSION_MESSAGE header describing the payload that follows, leaving buf ready
+// to go on the wire in a single write.
+//
+// It is WritePreframed without the write, for callers that hand the finished
+// frame to the connection's writer goroutine instead of writing it inline.
+func PutFrameHeader(buf []byte) error {
 	if len(buf) < FrameHeaderSize {
 		return fmt.Errorf("nbss: pre-framed buffer is %d bytes, need at least %d",
 			len(buf), FrameHeaderSize)
@@ -103,6 +117,5 @@ func WritePreframed(w io.Writer, buf []byte) error {
 	buf[1] = byte(n >> 16)
 	buf[2] = byte(n >> 8)
 	buf[3] = byte(n)
-	_, err := w.Write(buf)
-	return err
+	return nil
 }

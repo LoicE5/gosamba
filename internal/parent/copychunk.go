@@ -168,13 +168,9 @@ func (t *resumeKeyTable) len() int {
 // failure status. That is what MS-SMB2 §3.3.5.15.6 specifies and what the macOS
 // client parses — on EINVAL it re-reads the failed reply as an IOCTL response
 // and rejects anything whose StructureSize is not 49.
-func (d *Dispatcher) respondWithStatus(rw io.ReadWriter, hdr smb2.Header, sess *Session, status smb2.Status, body []byte) {
-	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted() || d.encryptChain.Load())
-	sign := !willEncrypt && sess != nil && len(sess.SigningKey) > 0
-	out := d.buildResponse(hdr, sess, status, body, sign)
+func (d *Dispatcher) respondWithStatus(rw io.Writer, hdr smb2.Header, sess *Session, status smb2.Status, body []byte) {
 	d.lastChainStatus = status
-	_ = d.writeFrame(rw, sess, out)
+	d.emit(rw, sess, d.buildResponse(hdr, status, body))
 }
 
 // respondCopyChunkRefusal answers a copychunk the server will not perform with

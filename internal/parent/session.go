@@ -78,6 +78,17 @@ type Open struct {
 	dirEntries []os.DirEntry
 	dirSent    int
 	dirRestart bool
+
+	// mu serializes the messages of concurrent frames that name this handle.
+	//
+	// Several of the fields above are mutable per-handle state with no lock of
+	// their own: the enumeration cursor, a named stream's buffer, a pipe's
+	// queued DCE/RPC response. They were safe only because a connection served
+	// one request at a time. The dispatcher now takes this lock around every
+	// message that carries a FileID (see lockOpenForMessage), shared for
+	// READ/WRITE on an ordinary file — which pread/pwrite and touch nothing
+	// here — and exclusive for everything else.
+	mu sync.RWMutex
 }
 
 // durableWriteAccess is the set of GrantedAccess bits that promise the client

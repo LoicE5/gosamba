@@ -400,7 +400,12 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 		}
 		return true
 	case smb2.CommandOplockBreak:
-		d.respondError(rw, hdr, smb2.StatusNotSupported, sess)
+		// MS-SMB2 §3.3.5.22 lists STATUS_INVALID_OPLOCK_PROTOCOL,
+		// STATUS_INVALID_PARAMETER and STATUS_FILE_CLOSED as the failures for a
+		// break the server cannot match; STATUS_NOT_SUPPORTED is not among
+		// them. We grant no oplocks or leases, so no acknowledgement can ever
+		// match one.
+		d.respondError(rw, hdr, smb2.StatusInvalidOplockProtocol, sess)
 		return true
 	default:
 		d.Log.Warn("unhandled command", "cmd", hdr.Command)

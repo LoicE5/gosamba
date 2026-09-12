@@ -30,12 +30,23 @@ var (
 	tagRqLs = []byte("RqLs") // lease request
 )
 
-// Lease state bits (MS-SMB2 §2.2.13.2.8). We only ever grant READ caching.
+// Lease state bits (MS-SMB2 §2.2.13.2.8 "SMB2_CREATE_REQUEST_LEASE",
+// LeaseState field). The order is READ, HANDLE, WRITE — HANDLE is 0x02 and
+// WRITE is 0x04, NOT the other way round. Apple's client header agrees
+// (SMBClient kernel/netsmb/smb_2.h: SMB2_LEASE_READ_CACHING 0x01,
+// SMB2_LEASE_HANDLE_CACHING 0x02, SMB2_LEASE_WRITE_CACHING 0x04).
+//
+// Getting these backwards is not cosmetic: putting WRITE_CACHING on the wire
+// when the intent was HANDLE_CACHING makes macOS clear its write-immediately
+// flag and enable unsafe write-behind caching.
+//
+// We currently only ever grant leaseNone (see applyDurableAndLease), but the
+// values must be right so that any future grant means what it says.
 const (
 	leaseNone          uint32 = 0x00
 	leaseReadCaching   uint32 = 0x01
-	leaseWriteCaching  uint32 = 0x02
-	leaseHandleCaching uint32 = 0x04
+	leaseHandleCaching uint32 = 0x02
+	leaseWriteCaching  uint32 = 0x04
 )
 
 // durableRequest is the parsed result of a fresh durable-handle request
@@ -57,8 +68,16 @@ type durableReconnect struct {
 }
 
 // leaseRequest is the parsed RqLs create context.
+//
+// v1 and v2 share the same context name ("RqLs"), so the only thing that tells
+// them apart is the request data length: 32 bytes is v1
+// (SMB2_CREATE_REQUEST_LEASE, MS-SMB2 §2.2.13.2.8) and 52 bytes is v2
+// (SMB2_CREATE_REQUEST_LEASE_V2, §2.2.13.2.10). The response must use the
+// matching form or the client rejects it — clients treat a v1 response to a v2
+// request as a lease failure, and directory leases are always v2.
 type leaseRequest struct {
 	present bool
+	v2      bool // true when the request arrived in the 52-byte v2 form
 	key     [16]byte
 	state   uint32
 }
@@ -103,9 +122,14 @@ func parseDurableContexts(raw []byte) (durableRequest, durableReconnect, leaseRe
 				copy(dc.fileID[:], c.Data[0:16])
 			}
 		case eqTag(c.Name, tagRqLs):
-			// v1: LeaseKey(16) LeaseState(4) Flags(4) Duration(8); v2 adds more.
+			// v1 (32 bytes): LeaseKey(16) LeaseState(4) LeaseFlags(4)
+			//                LeaseDuration(8)
+			// v2 (52 bytes): ... plus ParentLeaseKey(16) Epoch(2) Reserved(2)
+			// The length is the only discriminator; record it so the response
+			// goes back in the same form (MS-SMB2 §2.2.13.2.8 / §2.2.13.2.10).
 			if len(c.Data) >= 20 {
 				lr.present = true
+				lr.v2 = len(c.Data) >= rqLsV2Size
 				copy(lr.key[:], c.Data[0:16])
 				lr.state = binary.LittleEndian.Uint32(c.Data[16:])
 			}
@@ -139,11 +163,34 @@ func encodeDH2QResponse(timeout uint32, flags uint32) []byte {
 // encodeDHnQResponse builds the DHnQ v1 response context payload: 8 reserved.
 func encodeDHnQResponse() []byte { return make([]byte, 8) }
 
+// RqLs create-context payload sizes. Both the request and the response use
+// these exact lengths; a client that asked with one form and is answered with
+// the other treats the reply as malformed (Apple's SMBClient rejects any RqLs
+// response whose data length is neither 32 nor 52, and flags a version
+// mismatch as a lease failure).
+const (
+	rqLsV1Size = 32 // LeaseKey(16) LeaseState(4) Flags(4) Duration(8)
+	rqLsV2Size = 52 // ... + ParentLeaseKey(16) Epoch(2) Reserved(2)
+)
+
 // encodeRqLsResponse builds an RqLs response echoing the lease key and the
-// granted lease state. We use the v1 (32-byte) form: LeaseKey(16) LeaseState(4)
-// Flags(4) Duration(8).
-func encodeRqLsResponse(key [16]byte, granted uint32) []byte {
-	b := make([]byte, 32)
+// granted lease state, in the same version the client asked with.
+//
+//	v1 (MS-SMB2 §2.2.14.2.10, 32 bytes):
+//	    LeaseKey(16) LeaseState(4) LeaseFlags(4) LeaseDuration(8)
+//	v2 (MS-SMB2 §2.2.14.2.11, 52 bytes):
+//	    ... + ParentLeaseKey(16) Epoch(2) Reserved(2)
+//
+// Because we only ever grant LEASE_NONE, the v2 tail is all zeroes: no parent
+// lease key is echoed and SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET stays clear, so
+// a client will not compare the (absent) parent key, and Epoch 0 is correct for
+// a lease that was never established.
+func encodeRqLsResponse(key [16]byte, granted uint32, v2 bool) []byte {
+	size := rqLsV1Size
+	if v2 {
+		size = rqLsV2Size
+	}
+	b := make([]byte, size)
 	copy(b[0:16], key[:])
 	binary.LittleEndian.PutUint32(b[16:], granted)
 	return b
@@ -632,14 +679,14 @@ func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leas
 		// Grant NO caching (LEASE_NONE). A read-caching lease is a promise that
 		// the server will send a lease break before the file changes under the
 		// client; we implement no lease-break machinery (OPLOCK_BREAK is
-		// answered STATUS_NOT_SUPPORTED and nothing ever sends an unsolicited
-		// break), so a client that trusted a read lease would keep serving
+		// answered STATUS_INVALID_OPLOCK_PROTOCOL and nothing ever sends an
+		// unsolicited break), so a client that trusted a read lease would keep serving
 		// stale data indefinitely whenever another opener — or a process on the
 		// server itself — modified the file. Echoing LEASE_NONE keeps the
 		// client re-reading from the server, which is always correct.
 		ctxs = append(ctxs, smb2.CreateContext{
 			Name: tagRqLs,
-			Data: encodeRqLsResponse(lr.key, leaseNone),
+			Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2),
 		})
 	}
 

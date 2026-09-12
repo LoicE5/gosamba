@@ -63,4 +63,12 @@ const (
 	// (MS-SMB2 §3.3.5.18). Answering STATUS_NO_MORE_FILES instead silently
 	// truncates the listing.
 	StatusInfoLengthMismatch Status = 0xC0000004
+
+	// StatusInvalidOplockProtocol is one of the three statuses MS-SMB2
+	// §3.3.5.22 lists for an SMB2 OPLOCK_BREAK the server cannot honour
+	// (alongside STATUS_INVALID_PARAMETER and STATUS_FILE_CLOSED). It is the
+	// right answer for a break acknowledgement that matches no oplock or lease
+	// the server ever granted. STATUS_NOT_SUPPORTED is not in that list, and
+	// Windows/Samba clients branch on the listed codes.
+	StatusInvalidOplockProtocol Status = 0xC00000E3
 )

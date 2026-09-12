@@ -1526,6 +1526,10 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		open.File.Close()
 	}
 	if open.IsPipe {
+		// No POSTQUERY_ATTRIB echo here even when asked: a pipe has no times,
+		// no size and no attributes, so the only thing we could report is a
+		// block of zeros — which the client would reject anyway (see
+		// closeAttribsUsable).
 		d.respondSuccess(rw, hdr, sess, smb2.EncodeCloseResponse(smb2.CloseResponse{}))
 		return true
 	}
@@ -1561,7 +1565,7 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 			return true
 		}
 		now := filetimeFromTime(time.Now())
-		d.respondSuccess(rw, hdr, sess, smb2.EncodeCloseResponse(smb2.CloseResponse{
+		resp := smb2.CloseResponse{
 			CreationTime:   now,
 			LastAccessTime: now,
 			LastWriteTime:  now,
@@ -1569,7 +1573,13 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 			AllocationSize: uint64(len(open.streamBuf)),
 			EndOfFile:      uint64(len(open.streamBuf)),
 			FileAttributes: smb2.FileAttrNormal,
-		}))
+		}
+		// The stream's size is exact and the times are the ones a fresh
+		// QUERY_INFO on this handle would have reported, so the echo is honest.
+		if closeAttribsUsable(req, resp) {
+			resp.Flags = smb2.CloseFlagPostQueryAttrib
+		}
+		d.respondSuccess(rw, hdr, sess, smb2.EncodeCloseResponse(resp))
 		return true
 	}
 	if open.DeleteOnClose {
@@ -1618,8 +1628,33 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 			resp.FileAttributes = smb2.FileAttrNormal
 		}
 	}
+	// A failed Lstat (deleted by DELETE_ON_CLOSE, or the name vanished under
+	// us) leaves resp zeroed, and the guard keeps the flag off — the client
+	// then asks for the attributes itself instead of trusting a lie.
+	if closeAttribsUsable(req, resp) {
+		resp.Flags = smb2.CloseFlagPostQueryAttrib
+	}
 	d.respondSuccess(rw, hdr, sess, smb2.EncodeCloseResponse(resp))
 	return true
+}
+
+// closeAttribsUsable reports whether a CLOSE response may echo
+// SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB. Two conditions must hold: the client asked
+// for the attributes, and we actually have them.
+//
+// The second condition is not optional. macOS sets the flag on every CLOSE and
+// its parser throws away the *entire* attribute block if CreationTime,
+// LastAccessTime, LastWriteTime or ChangeTime comes back as zero, logging the
+// peer as a "Bad SMB 2/3 Server". Echoing the flag over a zeroed response is
+// therefore strictly worse than not echoing it: the client re-reads the
+// metadata with a fresh CREATE/QUERY_INFO/CLOSE either way, and we have also
+// told it we are broken.
+func closeAttribsUsable(req smb2.CloseRequest, resp smb2.CloseResponse) bool {
+	if req.Flags&smb2.CloseFlagPostQueryAttrib == 0 {
+		return false
+	}
+	return resp.CreationTime != 0 && resp.LastAccessTime != 0 &&
+		resp.LastWriteTime != 0 && resp.ChangeTime != 0
 }
 
 // --- QUERY_DIRECTORY ---

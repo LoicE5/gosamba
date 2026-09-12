@@ -11,6 +11,22 @@ import (
 
 var ErrTraversal = errors.New("vfs: path escapes share root")
 
+// ErrDanglingLink reports a symlink inside the share whose target does not
+// exist. It is a refusal like ErrTraversal — the path cannot be resolved, so no
+// caller may operate on it — but it is a DIFFERENT refusal: nothing escaped the
+// share, the link simply points at something that is not there.
+//
+// The distinction exists because the two deserve different NTSTATUS codes. A
+// containment failure is ACCESS_DENIED; a link that cannot be followed is
+// OBJECT_PATH_NOT_FOUND, which is what statusFromErr already reports for the
+// ELOOP the same situation produces one layer down. Collapsing both into
+// ErrTraversal made a dangling in-share symlink look like an attempted escape.
+//
+// It deliberately does NOT wrap ErrTraversal: callers that merely test err !=
+// nil (all of them today) keep refusing, and no caller can mistake a missing
+// target for a proven escape.
+var ErrDanglingLink = errors.New("vfs: symlink target does not exist")
+
 // Resolve takes a share root (absolute, cleaned) and a client-supplied
 // share-relative path (which may use either backslashes or forward slashes,
 // may begin with a slash, may be empty for the root). Returns an absolute
@@ -47,9 +63,13 @@ func Resolve(root, smbPath string) (string, error) {
 //
 // An in-share symlink whose resolved target remains within root is allowed and
 // the lexical (un-resolved) path is returned so callers continue to see the
-// expected share-relative location.
+// expected share-relative location. A caller that needs to OPEN such a path
+// must follow it with ResolveLink: the lexical path is the link itself, and an
+// O_NOFOLLOW open of a link fails with ELOOP.
 //
-// Returns ErrTraversal when the path escapes the share root.
+// Returns ErrTraversal when the path escapes the share root, and
+// ErrDanglingLink when the leaf is a symlink inside the share whose target does
+// not exist — both refusals, but different ones (see ErrDanglingLink).
 func ResolveSecure(root, smbPath string) (string, error) {
 	// Step 1: lexical containment (handles dot-dot, etc.).
 	lexical, err := Resolve(root, smbPath)
@@ -92,17 +112,79 @@ func ResolveSecure(root, smbPath string) (string, error) {
 	// Step 4: evaluate all symlinks on the existing ancestor.
 	real, err := filepath.EvalSymlinks(checkPath)
 	if err != nil {
+		// A missing target on a path that Lstat says exists means the leaf is a
+		// dangling symlink. That is not a containment failure, and reporting it
+		// as one made an ordinary broken link inside the share come back as
+		// ACCESS_DENIED. Classify it separately — but only once the chain ABOVE
+		// the link is proven contained, so a broken link reached THROUGH an
+		// escaping directory symlink is still reported as the escape it is.
+		if errors.Is(err, os.ErrNotExist) {
+			// The parent has to be canonicalized before it can be compared:
+			// canonRoot is symlink-free, and on a machine where the share sits
+			// under one (macOS /var → /private/var) the lexical parent never
+			// matches it.
+			if parent, perr := filepath.EvalSymlinks(filepath.Dir(checkPath)); perr == nil &&
+				contained(canonRoot, filepath.Clean(parent)) {
+				return "", ErrDanglingLink
+			}
+		}
 		// Unable to resolve — deny to be safe.
 		return "", ErrTraversal
 	}
 	real = filepath.Clean(real)
 
 	// Step 5: check that the real path is still under canonRoot.
-	if real != canonRoot && !strings.HasPrefix(real, canonRoot+string(filepath.Separator)) {
+	if !contained(canonRoot, real) {
 		return "", ErrTraversal
 	}
 
 	return lexical, nil
+}
+
+// contained reports whether p is canonRoot itself or lies beneath it. Both must
+// already be cleaned and free of symlinks, which is what EvalSymlinks gives.
+func contained(canonRoot, p string) bool {
+	return p == canonRoot || strings.HasPrefix(p, canonRoot+string(filepath.Separator))
+}
+
+// ResolveLink follows a symlink that lives inside the share and returns the
+// real path of its target, which is guaranteed to lie under root.
+//
+// ResolveSecure deliberately returns the LEXICAL path of a symlink so callers
+// keep seeing the share-relative location the client asked for. That is the
+// right answer for naming the object (rename and unlink act on the link, as
+// they do in POSIX), but not for opening it: opening the link path with
+// O_NOFOLLOW fails with ELOOP, which is why an in-share symlink was unopenable
+// over SMB even though the share is perfectly willing to serve its target.
+//
+// Callers use this to obtain the path they should actually open. Containment is
+// re-proven here rather than assumed: ResolveSecure ran against the state of
+// the filesystem at the time, and re-resolving now is what keeps a link that
+// has since been repointed outside the share from being opened.
+//
+// Returns ErrDanglingLink when the target does not exist and ErrTraversal when
+// it exists but lies outside root.
+func ResolveLink(root, path string) (string, error) {
+	canonRoot, err := filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		// Without a canonical root there is nothing to prove containment
+		// against, so the only safe answer is to refuse.
+		return "", ErrTraversal
+	}
+	canonRoot = filepath.Clean(canonRoot)
+
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrDanglingLink
+		}
+		return "", ErrTraversal
+	}
+	target = filepath.Clean(target)
+	if !contained(canonRoot, target) {
+		return "", ErrTraversal
+	}
+	return target, nil
 }
 
 // ResolveSecureNorm is like ResolveSecure but applies a Unicode-normalization-

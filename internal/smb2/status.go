@@ -78,6 +78,14 @@ const (
 	// Windows/Samba clients branch on the listed codes.
 	StatusInvalidOplockProtocol Status = 0xC00000E3
 
+	// StatusNotFound is what MS-SMB2 §3.3.5.9.5 mandates for a CREATE that
+	// carries an SMB2_CREATE_TIMEWARP_TOKEN when the share has no previous
+	// versions to open. It is deliberately not OBJECT_NAME_NOT_FOUND: the name
+	// may well exist in the live filesystem — what does not exist is the
+	// requested snapshot, and answering "no such name" would tell a snapshot
+	// mount the share is empty rather than that it has no snapshots.
+	StatusNotFound Status = 0xC0000225
+
 	// StatusInvalidViewSize is what MS-SMB2 §3.3.5.15.6 mandates for a
 	// server-side copy whose chunk names a source range running past the end of
 	// the source file. It is deliberately not STATUS_INVALID_PARAMETER: that

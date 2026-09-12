@@ -793,6 +793,21 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		}
 	}
 
+	// A timewarp token asks for the file as it was at a point in time. This
+	// server keeps no previous versions, so MS-SMB2 §3.3.5.9.5 requires the
+	// CREATE to fail with STATUS_NOT_FOUND rather than quietly serving the live
+	// file — which is what a snapshot-mounted macOS client would otherwise
+	// browse and copy while its UI claims to be showing the snapshot. The
+	// refusal is a status only: a timewarp RESPONSE context would hit the
+	// client's unknown-name arm and fail the CREATE with EBADRPC instead
+	// (see timewarp.go).
+	if hasTimewarpContext(req.CreateContexts) {
+		d.Log.Debug("create: timewarp token refused (no previous versions)",
+			"tree", tree.Share.Name, "name", req.Name)
+		d.respondError(rw, hdr, smb2.StatusNotFound, sess)
+		return true
+	}
+
 	baseName, streamName, streamOK := splitStreamName(req.Name)
 	if !streamOK {
 		// Non-$DATA stream type (e.g. $INDEX_ALLOCATION) — Samba returns
@@ -809,7 +824,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// ResolveSecureNorm still enforces symlink-containment inside the share.
 	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName)
 	if err != nil {
-		d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
+		d.respondError(rw, hdr, statusFromResolveErr(err), sess)
 		return true
 	}
 	wantedDir := req.CreateOptions&smb2.CreateOptDirectoryFile != 0
@@ -856,6 +871,82 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		return true
 	}
 
+	// An in-share symlink is served as the file it points at.
+	//
+	// ResolveSecureNorm deliberately returns the LEXICAL path of a symlink, so
+	// without this every call below would run against the link itself: the open
+	// is O_NOFOLLOW, which turns into ELOOP, and Lstat reports the link's own
+	// size (the length of the target path). That combination is exactly the
+	// reported symptom — the server does not claim FILE_SUPPORTS_REPARSE_POINTS,
+	// so macOS never sets FILE_OPEN_REPARSE_POINT and takes the
+	// FILE_ATTRIBUTE_NORMAL answer at face value; Finder lists the link as an
+	// ordinary small file and every open of it is refused.
+	//
+	// Containment is re-proven here rather than inherited from the resolve
+	// above, so a link repointed outside the share since then is still refused.
+	//
+	// The target becomes the path of the whole handle, not just of the open:
+	// QUERY_INFO, READ, WRITE and a durable reclaim all work from open.Path,
+	// and a handle whose metadata described the link while its data came from
+	// the target would be a worse bug than the one being fixed. The visible
+	// consequence is that DELETE_ON_CLOSE and rename act on the target rather
+	// than on the link, which is the same illusion the rest of this CREATE
+	// maintains.
+	if exists && st.Mode()&os.ModeSymlink != 0 {
+		target, lerr := vfs.ResolveLink(tree.Share.Path, osPath)
+		if lerr != nil {
+			d.Log.Debug("create: symlink not followed", "path", osPath, "err", lerr)
+			d.respondError(rw, hdr, statusFromResolveErr(lerr), sess)
+			return true
+		}
+		tst, terr := os.Lstat(target)
+		if terr != nil {
+			d.Log.Warn("create: lstat of symlink target failed", "path", target, "err", terr)
+			d.respondError(rw, hdr, statusFromErr(terr), sess)
+			return true
+		}
+		osPath, st, isDir = target, tst, tst.IsDir()
+	}
+
+	// Directory/non-directory validation, BEFORE the disposition switch.
+	//
+	// It used to run after it, and the switch creates before it checks: a
+	// DIRECTORY_FILE create for a name that did not exist was created as a
+	// regular FILE by the OVERWRITE_IF/SUPERSEDE arm and only then refused with
+	// STATUS_NOT_A_DIRECTORY, leaving a zero-byte file behind from a request
+	// that failed. Nothing in these checks needs the switch's result: the stat
+	// is already done, and for a name that does not exist the answer depends
+	// only on the request.
+	if wantedDir && wantedNonDir {
+		// MS-SMB2 §3.3.5.9: the two options are mutually exclusive. Refusing
+		// here also stops the same stray-object bug in its other form, where
+		// FILE_CREATE mkdir'd the directory and the NON_DIRECTORY_FILE check
+		// then failed the request with the new directory still on disk.
+		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	if wantedDir && truncatingDisposition(req.CreateDisposition) {
+		// MS-FSA §2.1.5.1: a directory is only ever brought into existence by
+		// FILE_CREATE or FILE_OPEN_IF. Truncation has no meaning for one, and
+		// the OVERWRITE_IF/SUPERSEDE arms below cannot honour DIRECTORY_FILE —
+		// they would create a regular file.
+		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	// FILE_CREATE is left to the switch: an existing name must be reported as
+	// STATUS_OBJECT_NAME_COLLISION whatever its type, and that arm creates
+	// nothing when the name is taken, so it cannot leave anything behind.
+	if exists && req.CreateDisposition != smb2.CreateDispositionCreate {
+		if wantedDir && !isDir {
+			d.respondError(rw, hdr, smb2.StatusNotADirectory, sess)
+			return true
+		}
+		if wantedNonDir && isDir {
+			d.respondError(rw, hdr, smb2.StatusFileIsADirectory, sess)
+			return true
+		}
+	}
+
 	// Share-access pre-check (MS-SMB2 §3.3.5.9). The authoritative test is the
 	// acquire further down, which runs against the fd we actually opened and is
 	// atomic with recording our own reservation. This earlier pass exists only
@@ -869,10 +960,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// FILE_CREATE on an existing name must still report
 	// STATUS_OBJECT_NAME_COLLISION — and the non-truncating dispositions have
 	// nothing to protect, since they do not touch the file before the acquire.
-	truncates := req.CreateDisposition == smb2.CreateDispositionOverwrite ||
-		req.CreateDisposition == smb2.CreateDispositionOverwriteIf ||
-		req.CreateDisposition == smb2.CreateDispositionSupersede
-	if truncates && exists && !isDir {
+	if truncatingDisposition(req.CreateDisposition) && exists && !isDir {
 		if key, ok := shareKeyForPath(osPath); ok &&
 			!sharedShareModes.check(key, req.DesiredAccess, req.ShareAccess) {
 			d.respondError(rw, hdr, smb2.StatusSharingViolation, sess)
@@ -945,7 +1033,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		}
 		createAction = smb2.CreateActionOverwritten
 		st, _ = os.Lstat(osPath)
-	case smb2.CreateDispositionOverwriteIf, smb2.CreateDispositionSupersede:
+	case smb2.CreateDispositionOverwriteIf:
 		if exists && !isDir {
 			if err := os.Truncate(osPath, 0); err != nil {
 				d.respondError(rw, hdr, statusFromErr(err), sess)
@@ -963,19 +1051,44 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		}
 		st, _ = os.Lstat(osPath)
 		exists = true
+	case smb2.CreateDispositionSupersede:
+		// FILE_SUPERSEDE is not FILE_OVERWRITE_IF. It shared that arm, so the
+		// response claimed FILE_WAS_OVERWRITTEN (3) for what the client asked
+		// to have superseded (0). macOS records the action without branching on
+		// it today, so this is cosmetic there and correctness for every client
+		// that does read it.
+		//
+		// Like Samba, superseding an existing file is implemented as a
+		// truncation rather than an unlink-and-recreate: the inode survives, so
+		// the FileId already handed out stays valid and no other handle to the
+		// file is broken. There are no DOS attributes to discard along with the
+		// contents — this server derives FileAttributes from the filesystem
+		// (directory or normal) and stores none of its own — so the reset the
+		// spec describes is a no-op here rather than something skipped.
+		if exists && !isDir {
+			if err := os.Truncate(osPath, 0); err != nil {
+				d.respondError(rw, hdr, statusFromErr(err), sess)
+				return true
+			}
+			createAction = smb2.CreateActionSuperseded
+		} else if !exists {
+			f, err := os.OpenFile(osPath, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0664)
+			if err != nil {
+				d.respondError(rw, hdr, statusFromErr(err), sess)
+				return true
+			}
+			f.Close()
+			createAction = smb2.CreateActionCreated
+		}
+		st, _ = os.Lstat(osPath)
+		exists = true
 	default:
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
-
-	if wantedDir && !isDir {
-		d.respondError(rw, hdr, smb2.StatusNotADirectory, sess)
-		return true
-	}
-	if wantedNonDir && isDir {
-		d.respondError(rw, hdr, smb2.StatusFileIsADirectory, sess)
-		return true
-	}
+	// The wantedDir/wantedNonDir checks that used to sit here now run before
+	// the switch, so a request that is going to be refused for asking for the
+	// wrong object type no longer creates the object first.
 
 	// Granted-access mask, reported back both in the MxAc create context and
 	// via FileAccessInformation / FileAllInformation.
@@ -1015,22 +1128,22 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		// O_NOFOLLOW on the leaf closes the TOCTOU window where a symlink
 		// swapped in after ResolveSecure would otherwise be followed silently.
 		f, err := os.OpenFile(osPath, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+		if err != nil && !wantsWrite && !errors.Is(err, syscall.ELOOP) {
+			// Read-only fallback. ELOOP is excluded because the retry would
+			// fail exactly the same way — O_NOFOLLOW refuses a symlink whatever
+			// the access mode.
+			f, err = os.OpenFile(osPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		}
 		if err != nil {
-			if errors.Is(err, syscall.ELOOP) {
-				d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
-				return true
-			}
-			if !wantsWrite {
-				f, err = os.OpenFile(osPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-			}
-			if err != nil {
-				if errors.Is(err, syscall.ELOOP) {
-					d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
-					return true
-				}
-				d.respondError(rw, hdr, statusFromErr(err), sess)
-				return true
-			}
+			// ELOOP can only mean a symlink was swapped in after the resolve
+			// and the in-share re-resolve above, since osPath is the resolved
+			// target by now. It is reported through statusFromErr like every
+			// other errno, which maps it to STATUS_OBJECT_PATH_NOT_FOUND —
+			// the same answer the resolve gives for a link it cannot follow.
+			// The two used to disagree, one saying ACCESS_DENIED and the other
+			// OBJECT_PATH_NOT_FOUND for the same unopenable symlink.
+			d.respondError(rw, hdr, statusFromErr(err), sess)
+			return true
 		}
 		open.File = f
 	}
@@ -1121,6 +1234,35 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	})
 	d.respondSuccess(rw, hdr, sess, resp)
 	return true
+}
+
+// truncatingDisposition reports whether a CreateDisposition empties the file it
+// opens. The three that do are the ones that must not run before the sharing
+// check, and the ones that cannot bring a directory into existence.
+func truncatingDisposition(disposition uint32) bool {
+	return disposition == smb2.CreateDispositionOverwrite ||
+		disposition == smb2.CreateDispositionOverwriteIf ||
+		disposition == smb2.CreateDispositionSupersede
+}
+
+// statusFromResolveErr maps a path-resolution failure to an NTSTATUS.
+//
+// A symlink the server will not follow is reported as
+// STATUS_OBJECT_PATH_NOT_FOUND — the same status statusFromErr gives for the
+// ELOOP an O_NOFOLLOW open of one produces, so the two layers cannot disagree
+// about the same link the way they used to. From the client's side the
+// statement is accurate: the path it asked for does not lead anywhere this
+// share can serve.
+//
+// Everything else — a lexical ".." escape, a symlink whose target is outside
+// the share — stays ACCESS_DENIED. That distinction is deliberate: a proven
+// containment failure is a refusal, not a missing name, and reporting it as one
+// would invite a client to retry by creating the name.
+func statusFromResolveErr(err error) smb2.Status {
+	if errors.Is(err, vfs.ErrDanglingLink) {
+		return smb2.StatusObjectPathNotFound
+	}
+	return smb2.StatusAccessDenied
 }
 
 // statusFromErr maps a filesystem error to the NTSTATUS a client expects.

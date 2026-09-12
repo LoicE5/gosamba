@@ -20,6 +20,10 @@ const (
 	aeadTagHeadroom = 16
 )
 
+// FrameHeaderSize is the length of the NBSS header that precedes every payload
+// on the wire: one type byte and a 24-bit big-endian length.
+const FrameHeaderSize = 4
+
 var (
 	ErrUnsupportedFrameType = errors.New("nbss: unsupported frame type")
 	ErrFrameTooLarge        = errors.New("nbss: frame too large")
@@ -59,16 +63,46 @@ func ReadFrame(r io.Reader, maxSize uint32) ([]byte, error) {
 // WriteFrame writes one NBSS SESSION_MESSAGE frame as a single Write call,
 // avoiding two small TCP writes per response (which interact poorly with
 // delayed-ACK on some clients).
+//
+// It copies payload into a freshly framed buffer. A caller that can reserve
+// FrameHeaderSize bytes at the front of its own buffer should build the
+// response there and use WritePreframed instead, which skips this copy.
 func WriteFrame(w io.Writer, payload []byte) error {
 	if uint64(len(payload)) > 0xFFFFFF {
 		return fmt.Errorf("%w: %d > 16777215", ErrFrameTooLarge, len(payload))
 	}
-	out := make([]byte, 4+len(payload))
-	out[0] = frameTypeSessionMessage
-	out[1] = byte(len(payload) >> 16)
-	out[2] = byte(len(payload) >> 8)
-	out[3] = byte(len(payload))
-	copy(out[4:], payload)
-	_, err := w.Write(out)
+	out := make([]byte, FrameHeaderSize+len(payload))
+	copy(out[FrameHeaderSize:], payload)
+	return WritePreframed(w, out)
+}
+
+// WritePreframed writes buf as one NBSS SESSION_MESSAGE frame, where buf's
+// first FrameHeaderSize bytes are reserved room for the header rather than
+// payload: the caller built the SMB2 message into buf[FrameHeaderSize:] and
+// left the front untouched. The header is filled in place and the whole slice
+// goes out in the same single Write that WriteFrame performs.
+//
+// This exists for the READ response path, which allocates one buffer covering
+// NBSS header + SMB2 header + READ body + file data and preads straight into
+// the data region. Without it that buffer would be copied a second time here
+// just to prepend four bytes — at a 512 KiB payload, a whole extra payload's
+// worth of allocation and memmove per response.
+//
+// The payload length is taken from len(buf), so buf must be exactly the frame:
+// slice it to length before calling.
+func WritePreframed(w io.Writer, buf []byte) error {
+	if len(buf) < FrameHeaderSize {
+		return fmt.Errorf("nbss: pre-framed buffer is %d bytes, need at least %d",
+			len(buf), FrameHeaderSize)
+	}
+	n := len(buf) - FrameHeaderSize
+	if uint64(n) > 0xFFFFFF {
+		return fmt.Errorf("%w: %d > 16777215", ErrFrameTooLarge, n)
+	}
+	buf[0] = frameTypeSessionMessage
+	buf[1] = byte(n >> 16)
+	buf[2] = byte(n >> 8)
+	buf[3] = byte(n)
+	_, err := w.Write(buf)
 	return err
 }

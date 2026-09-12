@@ -1247,13 +1247,21 @@ func (d *Dispatcher) handleRead(rw io.ReadWriter, hdr smb2.Header, body []byte, 
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
-	// A read may not cross another handle's exclusive byte-range lock.
+	// A read may not cross another handle's exclusive byte-range lock. This is
+	// deliberately checked over the *requested* range and before the EOF
+	// clamp below: byte-range locks may extend past end-of-file, and a lock
+	// conflict outranks END_OF_FILE for a read that straddles both.
 	if d.locks != nil && d.locks.conflictsWith(open, req.Offset, uint64(req.Length), false) {
 		d.respondError(rw, hdr, smb2.StatusFileLockConflict, sess)
 		return true
 	}
-	buf := make([]byte, req.Length)
-	n, err := open.File.ReadAt(buf, int64(req.Offset))
+	length, eof := readLengthForOpen(open, req.Offset, req.Length)
+	if eof {
+		d.respondError(rw, hdr, smb2.StatusEndOfFile, sess)
+		return true
+	}
+	buf, data, prefix := d.newReadResponseFrame(sess, int(length))
+	n, err := open.File.ReadAt(data, int64(req.Offset))
 	if err != nil && err != io.EOF {
 		d.Log.Warn("read failed", "path", open.Path, "err", err)
 		d.respondError(rw, hdr, statusFromErr(err), sess)
@@ -1263,9 +1271,128 @@ func (d *Dispatcher) handleRead(rw io.ReadWriter, hdr smb2.Header, body []byte, 
 		d.respondError(rw, hdr, smb2.StatusEndOfFile, sess)
 		return true
 	}
-	resp := smb2.EncodeReadResponse(smb2.ReadResponse{Data: buf[:n]})
-	d.respondSuccess(rw, hdr, sess, resp)
+	d.sendReadResponseFrame(rw, hdr, sess, buf, prefix, n)
 	return true
+}
+
+// readLengthForOpen decides how many bytes a READ at offset may actually
+// allocate for, given that it asked for want.
+//
+// The client is under no obligation to clamp its own reads to end-of-file.
+// macOS deliberately does not: smbfs_io.c ("Dont check for reads past EOF ...
+// Just try the read request as is") issues every read at the full negotiated
+// quantum, so the tail of any transfer — and every read of a file smaller than
+// the quantum — over-asks. Honouring want literally meant allocating and
+// zeroing a megabyte to return four kilobytes.
+//
+// The second return value is true when the offset is at or past end-of-file,
+// which the caller answers with STATUS_END_OF_FILE. That is the same status
+// the old code produced when the pread came back with zero bytes, so the wire
+// behaviour is unchanged; only the allocation is.
+//
+// The clamp applies to regular files only. A character device or FIFO reports
+// a meaningless st_size, and clamping to it would invent a short read where
+// the descriptor really does have bytes to give.
+func readLengthForOpen(open *Open, offset uint64, want uint32) (length uint32, eof bool) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(open.File.Fd()), &st); err != nil {
+		return want, false
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Size < 0 {
+		return want, false
+	}
+	size := uint64(st.Size)
+	if offset >= size {
+		return 0, true
+	}
+	if avail := size - offset; uint64(want) > avail {
+		return uint32(avail), false
+	}
+	return want, false
+}
+
+// readResponseFixed is the fixed part of the SMB2 READ response body. With the
+// 64-byte header ahead of it this puts DataOffset at 80, which is what the
+// response advertises and what clients (Apple's parser underflows below 80)
+// require.
+const readResponseFixed = 16
+
+// newReadResponseFrame allocates the one buffer a READ response needs and
+// returns it together with the sub-slice the file data is to be pread into.
+//
+// The whole point is that this is a single allocation covering every layer:
+// NBSS header, SMB2 header, READ body and payload. The payload is never copied
+// — the pread lands on its final resting place on the wire. Building the
+// response the obvious way instead (read into a buffer, encode the body into a
+// second, prepend the header into a third, frame into a fourth) cost four
+// allocations and three payload-sized copies per response.
+//
+// The NBSS header is only reserved when the response will go out in cleartext.
+// An encrypted response is re-framed by smb3.EncryptTransform, which prepends
+// its own 52-byte transform header into a buffer of its own, so reserving the
+// four bytes here would just push a stale gap through the AEAD. In that case
+// the frame starts at the SMB2 header and sendReadResponseFrame hands it to
+// the ordinary writeFrame path.
+func (d *Dispatcher) newReadResponseFrame(sess *Session, n int) (buf, data []byte, prefix int) {
+	prefix = transport.FrameHeaderSize
+	if d.willEncryptResponse(sess) {
+		prefix = 0
+	}
+	buf = make([]byte, prefix+smb2.HeaderSize+readResponseFixed+n)
+	return buf, buf[prefix+smb2.HeaderSize+readResponseFixed:], prefix
+}
+
+// sendReadResponseFrame fills in the headers of a frame from
+// newReadResponseFrame and writes it. prefix is that call's third return value
+// and n is how many bytes the pread actually delivered — which may be fewer
+// than the buffer holds if the file shrank between the fstat and the read.
+func (d *Dispatcher) sendReadResponseFrame(rw io.Writer, reqHdr smb2.Header, sess *Session, buf []byte, prefix, n int) {
+	// A short read leaves unused tail bytes; cut them off rather than send
+	// zero padding the client would count as data.
+	buf = buf[:prefix+smb2.HeaderSize+readResponseFixed+n]
+	msg := buf[prefix:]
+
+	_ = smb2.EncodeHeader(msg[:smb2.HeaderSize], smb2.Header{
+		CreditCharge:   reqHdr.CreditCharge,
+		Status:         uint32(smb2.StatusSuccess),
+		Command:        reqHdr.Command,
+		CreditResponse: grantCredits(reqHdr.CreditCharge, reqHdr.CreditResponse),
+		Flags:          smb2.FlagServerToRedir,
+		MessageID:      reqHdr.MessageID,
+		TreeID:         reqHdr.TreeID,
+		SessionID:      reqHdr.SessionID,
+	})
+
+	// READ response body, byte-for-byte what smb2.EncodeReadResponse emits.
+	// Reserved (byte 3), DataRemaining (bytes 8-11) and Reserved2 (12-15) stay
+	// zero, which they already are in a freshly allocated buffer.
+	body := msg[smb2.HeaderSize:]
+	binary.LittleEndian.PutUint16(body[0:], 17) // StructureSize
+	body[2] = byte(smb2.HeaderSize + readResponseFixed)
+	binary.LittleEndian.PutUint32(body[4:], uint32(n))
+
+	d.lastChainStatus = smb2.StatusSuccess
+	if prefix == 0 {
+		// Encrypted: writeFrame wraps msg in a transform header and frames it.
+		_ = d.writeFrame(rw, sess, msg)
+		return
+	}
+	if sess != nil && len(sess.SigningKey) > 0 && d.Conn != nil {
+		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, msg)
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	_ = transport.WritePreframed(rw, buf)
+}
+
+// willEncryptResponse reports whether a response on this chain goes back
+// wrapped in an SMB3 transform header. It mirrors the condition writeFrame
+// applies; the read path needs to know it up front, because an encrypted
+// response cannot be pre-framed.
+func (d *Dispatcher) willEncryptResponse(sess *Session) bool {
+	return sess != nil && len(sess.S2CCipherKey) > 0 &&
+		d.Conn != nil && d.Conn.Selection.Cipher != 0 &&
+		(sess.GotEncrypted() || d.encryptChain.Load())
 }
 
 // --- WRITE ---
@@ -1320,6 +1447,17 @@ func (d *Dispatcher) handleWrite(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		return true
 	}
 	if open.File == nil {
+		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	// Clamp to the negotiated MaxWriteSize, mirroring the READ path. Without
+	// this the only bound on a WRITE was transport.MaxFrameSize (16 MiB)
+	// against an advertised 8 MiB, so a client could push twice what it was
+	// told the server would take. macOS never does — it clamps itself to
+	// 2 MiB — but a hostile or simply non-macOS client is not obliged to.
+	if d.Conn != nil && d.Conn.MaxIOSize != 0 && req.Length > d.Conn.MaxIOSize {
+		d.Log.Warn("WRITE exceeds negotiated MaxWriteSize",
+			"requested", req.Length, "max", d.Conn.MaxIOSize)
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}

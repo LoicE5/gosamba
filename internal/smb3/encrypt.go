@@ -141,20 +141,42 @@ func DecryptTransform(cipherID uint16, key, frame []byte) ([]byte, uint64, error
 		return nil, 0, ErrShortTransformBody
 	}
 
-	aead, nonceLen, err := newAEAD(cipherID, key)
+	aead, nonceLen, err := aeadFor(cipherID, key)
 	if err != nil {
 		return nil, 0, err
 	}
 	nonce := frame[20 : 20+nonceLen]
 
-	// Reconstruct: ciphertext-with-tag = ciphertext || signature(16).
+	// The AEAD wants ciphertext||tag contiguous, but the transform header keeps
+	// the tag in its Signature field at offset 4. Rebuilding that by copying the
+	// whole body cost two payload-sized buffers per frame (~2x the payload in
+	// B/op): one for ciphertext||tag, one for the plaintext Open returned.
+	//
+	// transport.ReadFrame deliberately leaves 16 bytes of spare capacity on
+	// every frame, so the tag can be appended straight after the ciphertext and
+	// the plaintext decrypted back over it — no payload-sized allocation at all.
+	// Frames that arrive without that headroom (tests, other callers) fall back
+	// to the copy.
+	//
+	// This is an allocation and GC win, not a latency win: Go's GCM Open takes a
+	// slower per-byte path when input and output alias, so wall clock is roughly
+	// a wash while B/op drops from ~2x the payload to a constant.
 	tag := frame[4:20]
-	ct := make([]byte, len(ciphertext)+16)
-	copy(ct, ciphertext)
-	copy(ct[len(ciphertext):], tag)
+	n := len(ciphertext)
+	var ct []byte
+	if cap(ciphertext) >= n+16 {
+		ct = ciphertext[:n+16]
+	} else {
+		ct = make([]byte, n+16)
+		copy(ct, ciphertext)
+	}
+	copy(ct[n:], tag)
 
 	aad := frame[transformAADStart : transformAADStart+transformAADLen]
-	pt, err := aead.Open(nil, nonce, ct, aad)
+	// ct[:0] aliases ct exactly, which cipher.AEAD permits (only *inexact*
+	// overlap is rejected), and GCM authenticates before it decrypts so reading
+	// the ciphertext it is overwriting is safe.
+	pt, err := aead.Open(ct[:0], nonce, ct, aad)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", ErrTransformDecrypt, err)
 	}
@@ -164,7 +186,7 @@ func DecryptTransform(cipherID uint16, key, frame []byte) ([]byte, uint64, error
 // EncryptTransform produces a transform-wrapped frame for plaintext using key.
 // sessID is written into the header so the peer can locate the session.
 func EncryptTransform(cipherID uint16, key []byte, sessID uint64, plaintext []byte) ([]byte, error) {
-	aead, nonceLen, err := newAEAD(cipherID, key)
+	aead, nonceLen, err := aeadFor(cipherID, key)
 	if err != nil {
 		return nil, err
 	}
@@ -178,20 +200,29 @@ func EncryptTransform(cipherID uint16, key []byte, sessID uint64, plaintext []by
 	nonce := make([]byte, nonceLen)
 	nextNonce(nonce)
 
-	out := make([]byte, TransformHeaderSize+len(plaintext)+16)
+	// Length is just the header; the capacity covers header + ciphertext + tag
+	// so that Seal appends straight into this buffer's spare bytes. Sealing into
+	// a fresh buffer instead (Seal(nil, ...)) allocated a second payload-sized
+	// slice and then copied the whole ciphertext back — two payload-sized
+	// allocations and a full copy per frame.
+	out := make([]byte, TransformHeaderSize, TransformHeaderSize+len(plaintext)+16)
 	copy(out[:4], transformProtocolID[:])
-	// signature filled in after seal
+	// out[4:20] (Signature) stays zero until the tag is moved into it below; it
+	// is not part of the AAD, so its value during Seal is irrelevant.
 	copy(out[20:20+nonceLen], nonce)
 	binary.LittleEndian.PutUint32(out[36:], uint32(len(plaintext)))
 	binary.LittleEndian.PutUint16(out[42:], TransformFlagEncrypted)
 	binary.LittleEndian.PutUint64(out[44:], sessID)
 
 	aad := out[transformAADStart : transformAADStart+transformAADLen]
-	sealed := aead.Seal(nil, nonce, plaintext, aad)
-	// sealed = ciphertext || tag(16)
-	copy(out[TransformHeaderSize:], sealed[:len(plaintext)])
-	copy(out[4:20], sealed[len(plaintext):])
-	return out[:TransformHeaderSize+len(plaintext)], nil
+	// sealed = header(52) || ciphertext(n) || tag(16), written in place.
+	sealed := aead.Seal(out, nonce, plaintext, aad)
+	// On the wire the tag lives in the transform header's Signature field, not
+	// after the ciphertext, so move the trailing 16 bytes to offset 4 and cut
+	// them off the end.
+	tagOff := len(sealed) - 16
+	copy(sealed[4:20], sealed[tagOff:])
+	return sealed[:tagOff], nil
 }
 
 func newAEAD(cipherID uint16, rawKey []byte) (cipher.AEAD, int, error) {

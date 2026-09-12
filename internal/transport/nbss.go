@@ -14,6 +14,10 @@ const MaxFrameSize = 16 * 1024 * 1024
 
 const (
 	frameTypeSessionMessage = 0x00
+
+	// aeadTagHeadroom is the spare capacity ReadFrame leaves past the end of
+	// every payload: exactly one AES-GCM/CCM tag. See ReadFrame.
+	aeadTagHeadroom = 16
 )
 
 var (
@@ -38,7 +42,14 @@ func ReadFrame(r io.Reader, maxSize uint32) ([]byte, error) {
 	if length == 0 {
 		return []byte{}, nil
 	}
-	payload := make([]byte, length)
+	// Spare capacity, not spare length: the frame is exactly `length` bytes and
+	// the framing is unchanged. The 16 extra bytes of capacity exist so that an
+	// SMB3 transform frame can have its 16-byte AEAD tag appended after the
+	// ciphertext and be decrypted in place, instead of copying the whole body
+	// into a new buffer just to make ciphertext||tag contiguous
+	// (see smb3.DecryptTransform). Unencrypted frames simply never touch it.
+	n := int(length)
+	payload := make([]byte, n, n+aeadTagHeadroom)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}

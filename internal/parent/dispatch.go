@@ -2198,6 +2198,40 @@ func openFileInfo(o *Open) os.FileInfo {
 	return info
 }
 
+// fileIDFor returns the identifier this server reports for a handle. It is the
+// exact value encodeDirRecord writes into the FileId field of the
+// FILE_ID_BOTH/FULL_DIR_INFORMATION records — the real inode, obtained from the
+// same unixModeAndInode helper — so a file enumerated in a directory listing and
+// the same file stat'ed through QUERY_INFO can never report two different ids.
+//
+// This is not cosmetic on macOS. smbfs treats a changed id for a path as "this
+// path now holds a different object": see node_vtype_changed and smbfs_nget in
+// smbfs_node.c, which purge the vnode from the name cache, pull it out of the
+// node hash and drop it, zero the attribute and symlink cache timers, and
+// invalidate the page cache. Two encoders disagreeing means that happens for
+// every file, on every stat.
+//
+// Named-stream handles carry a synthetic streamFileInfo with no syscall.Stat_t
+// behind it, so they have no inode of their own; we fall back to the inode of
+// the base file the stream hangs off (o.Path is the base file even for a stream
+// Open). That matches NTFS, where every stream of a file shares the file's MFT
+// record number, and it keeps a stream handle from reporting 0 — a zero id tells
+// the client the server has no usable File IDs and makes it stop trusting them.
+func fileIDFor(info os.FileInfo, o *Open) uint64 {
+	if _, ino := unixModeAndInode(info); ino != 0 {
+		return ino
+	}
+	// Synthetic FileInfo (named streams): report the base file's inode.
+	if o != nil && o.Path != "" {
+		if st, err := os.Lstat(o.Path); err == nil {
+			if _, ino := unixModeAndInode(st); ino != 0 {
+				return ino
+			}
+		}
+	}
+	return 0
+}
+
 func encodeFileInfo(class uint8, info os.FileInfo, o *Open) ([]byte, bool) {
 	if info == nil {
 		return nil, false
@@ -2241,12 +2275,9 @@ func encodeFileInfo(class uint8, info os.FileInfo, o *Open) ([]byte, bool) {
 		return out, true
 	case smb2.FileInternalInformation:
 		out := make([]byte, 8)
-		// Use the inode-like value: hash of path is a reasonable proxy.
-		var v uint64
-		for _, c := range o.Path {
-			v = v*131 + uint64(c)
-		}
-		binary.LittleEndian.PutUint64(out[0:], v)
+		// IndexNumber — the real inode, the same value the directory encoder
+		// reports as this file's FileId.
+		binary.LittleEndian.PutUint64(out[0:], fileIDFor(info, o))
 		return out, true
 	case smb2.FileEaInformation:
 		return make([]byte, 4), true
@@ -2331,12 +2362,9 @@ func encodeFileInfo(class uint8, info os.FileInfo, o *Open) ([]byte, bool) {
 		if info.IsDir() {
 			out[61] = 0x01 // Directory
 		}
-		// Internal (8) at offset 64 — best-effort inode-like value
-		var v uint64
-		for _, c := range o.Path {
-			v = v*131 + uint64(c)
-		}
-		binary.LittleEndian.PutUint64(out[64:], v)
+		// Internal (8) at offset 64 — IndexNumber, the real inode. Identical
+		// to FileInternalInformation and to the directory encoder's FileId.
+		binary.LittleEndian.PutUint64(out[64:], fileIDFor(info, o))
 		// Ea (4) at 72 — zero
 		// Access (4) at 76
 		access := o.GrantedAccess

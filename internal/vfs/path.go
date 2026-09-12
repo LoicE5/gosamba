@@ -197,9 +197,14 @@ func ResolveLink(root, path string) (string, error) {
 // path uses the actual on-disk names, which are then validated by ResolveSecure
 // to ensure containment within the share root.
 //
+// foldCase is passed straight through to ResolveNorm for every component; see
+// ResolveNorm for what it means and why it is not simply "the share is
+// case-insensitive". The fast path below is unaffected by it: a path that
+// resolves as spelled resolves the same either way.
+//
 // Fast path: if the lexical path resolves without any normalization miss, it
 // delegates directly to ResolveSecure (no directory scanning overhead).
-func ResolveSecureNorm(root, smbPath string) (string, error) {
+func ResolveSecureNorm(root, smbPath string, foldCase bool) (string, error) {
 	root = filepath.Clean(root)
 
 	// Normalize slashes and split into components.
@@ -231,7 +236,7 @@ func ResolveSecureNorm(root, smbPath string) (string, error) {
 			current = filepath.Dir(current)
 			continue
 		}
-		resolved, ok := ResolveNorm(current, comp)
+		resolved, ok := ResolveNorm(current, comp, foldCase)
 		if !ok {
 			// Component not found even after normalization — keep the
 			// requested name (e.g. for new-file CREATE paths).

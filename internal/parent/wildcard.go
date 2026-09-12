@@ -69,8 +69,29 @@ import (
 // DOS_STAR is `*` bounded by the position of the final period in the name, so
 // it slots into the same backtrack point `*` already uses.
 
-// matchSMBPattern reports whether name matches the SMB search pattern,
-// case-insensitively. An empty pattern, and the pattern `*`, match everything.
+// matchSMBPattern reports whether name matches the SMB search pattern. An empty
+// pattern, and the pattern `*`, match everything.
+//
+// # Case
+//
+// caseSensitive must be the share's real, probed case sensitivity — the same
+// value the AAPL volume-capability bit and FILE_CASE_SENSITIVE_SEARCH carry
+// (parent.shareCaseSensitive). It is not a preference.
+//
+// This matcher used to fold case unconditionally while vfs.ResolveNorm resolved
+// case-sensitively, and the two disagreed on every case-sensitive backing
+// filesystem. macOS resolves a single name through a QUERY_DIRECTORY whose
+// pattern is the exact leaf name, so a request for `foo` matched an on-disk
+// `Foo` here, the client was told the file existed, and the CREATE that
+// followed answered STATUS_NO_SUCH_FILE. SMBClient maps that to ENOENT and
+// parks it in the negative name cache, which only clears once the parent
+// directory's mtime advances: Finder shows the file, opening it fails, and it
+// keeps failing. On a case-insensitive filesystem the resolver's exact-match
+// fast path hid the whole thing, so it bit Linux and not APFS.
+//
+// Folding here is therefore gated on the same probe the resolver's foldCase
+// argument comes from. On a case-sensitive share `foo` no longer matches `Foo`
+// and the client is told the truth up front.
 //
 // The matcher is a two-pointer scan with a single backtrack point: on a
 // mismatch it rewinds to just past the most recent `*` and lets that `*`
@@ -79,7 +100,7 @@ import (
 // pattern costs at worst O(len(pattern) x len(name)) steps before terminating.
 // It runs once per directory entry per QUERY_DIRECTORY, so the two lowercased
 // copies the previous implementation built per call were pure waste.
-func matchSMBPattern(pattern, name string) bool {
+func matchSMBPattern(pattern, name string, caseSensitive bool) bool {
 	if pattern == "" || pattern == "*" {
 		return true
 	}
@@ -113,7 +134,7 @@ func matchSMBPattern(pattern, name string) bool {
 			if nc >= utf8.RuneSelf {
 				nc, nsize = decodeRune(name[n:])
 			}
-			if pc == '?' || pc == nc || foldEqual(pc, nc) {
+			if pc == '?' || pc == nc || (!caseSensitive && foldEqual(pc, nc)) {
 				p += psize
 				n += nsize
 				continue
@@ -161,7 +182,14 @@ func decodeRune(s string) (rune, int) {
 
 // foldEqual reports whether a and b are the same character ignoring case. It
 // allocates nothing. The match loop calls it only once it has found the two
-// runes unequal, but it is correct standalone.
+// runes unequal and only on a case-insensitive share, but it is correct
+// standalone.
+//
+// It states the same equivalence as vfs.FoldRune, which the path resolver uses
+// to build its fold keys, from the other end: this walks a's orbit looking for
+// b, FoldRune reduces an orbit to its smallest member. They MUST agree, or the
+// matcher and the resolver drift apart again —
+// TestFoldRuneAgreesWithFoldEqual proves it over the whole rune range.
 //
 // Non-ASCII goes through unicode.SimpleFold, the same equivalence
 // strings.EqualFold uses. That is simple (one rune in, one rune out) case

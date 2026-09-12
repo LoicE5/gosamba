@@ -181,7 +181,7 @@ func TestResolveSecureNorm_NewLeafUnderNFDDir(t *testing.T) {
 	populate(t, nfdDir, 200)
 
 	scans := countDirScans(t)
-	got, err := ResolveSecureNorm(root, nfcCafe+`\brand-new-file.txt`)
+	got, err := ResolveSecureNorm(root, nfcCafe+`\brand-new-file.txt`, false)
 	if err != nil {
 		t.Fatalf("ResolveSecureNorm: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestResolveSecureNorm_NewFileDoesNotScan(t *testing.T) {
 	populate(t, sub, 2000)
 
 	scans := countDirScans(t)
-	got, err := ResolveSecureNorm(root, `sub\brand-new-file.txt`)
+	got, err := ResolveSecureNorm(root, `sub\brand-new-file.txt`, false)
 	if err != nil {
 		t.Fatalf("ResolveSecureNorm: %v", err)
 	}

@@ -938,7 +938,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// Use normalization-insensitive resolution so an NFD-named file (created
 	// on macOS) can be found by an NFC lookup (Windows/Linux), and vice-versa.
 	// ResolveSecureNorm still enforces symlink-containment inside the share.
-	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName)
+	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName, shareFoldsCase(tree))
 	if err != nil {
 		d.respondError(rw, hdr, statusFromResolveErr(err), sess)
 		return true
@@ -1857,7 +1857,7 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 		// Use normalization-insensitive resolution for the rename destination so
 		// that lookups across NFC/NFD boundaries work. For a new name (doesn't
 		// exist yet), it falls through to the requested name unchanged.
-		newPath, err := vfs.ResolveSecureNorm(open.Tree.Share.Path, newName)
+		newPath, err := vfs.ResolveSecureNorm(open.Tree.Share.Path, newName, shareFoldsCase(open.Tree))
 		if err != nil {
 			d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 			return true
@@ -2269,21 +2269,30 @@ func (d *Dispatcher) handleQueryDirectory(rw io.ReadWriter, hdr smb2.Header, bod
 		}
 		all = append(all, entries...)
 
-		// Apply pattern filter (SMB-style glob, case-insensitive). Hide
-		// names containing `:` so any pre-existing stream-syntax pollution
-		// (created before stream parsing was wired up) is invisible to
-		// clients — `:` is illegal in NTFS names anyway, so a real SMB
-		// client could never have legitimately created such a name.
+		// Apply pattern filter (SMB-style glob). Hide names containing `:` so
+		// any pre-existing stream-syntax pollution (created before stream
+		// parsing was wired up) is invisible to clients — `:` is illegal in
+		// NTFS names anyway, so a real SMB client could never have
+		// legitimately created such a name.
+		//
+		// The matcher folds case only where the backing filesystem does.
+		// macOS resolves a single name through a one-entry QUERY_DIRECTORY
+		// whose pattern IS the leaf name, so matching `foo` against an on-disk
+		// `Foo` on a case-sensitive share told the client a file existed that
+		// the following CREATE could not open — and the client cached that
+		// ENOENT. One probe, read once per enumeration rather than per entry,
+		// drives both this and the resolver.
 		pattern := req.FileName
 		if pattern == "" {
 			pattern = "*"
 		}
+		caseSensitive := shareCaseSensitive(open.Tree)
 		filtered := all[:0:0]
 		for _, e := range all {
 			if strings.ContainsRune(e.Name(), ':') {
 				continue
 			}
-			if matchSMBPattern(pattern, e.Name()) {
+			if matchSMBPattern(pattern, e.Name(), caseSensitive) {
 				filtered = append(filtered, e)
 			}
 		}
@@ -2352,7 +2361,8 @@ func (d *Dispatcher) handleQueryDirectory(rw io.ReadWriter, hdr smb2.Header, bod
 }
 
 // matchSMBPattern lives in wildcard.go: SMB search patterns use the DOS
-// grammar (only `*` and `?` are metacharacters), not shell globbing.
+// grammar (only `*` and `?` are metacharacters), not shell globbing, and they
+// fold case only on a share whose backing filesystem does.
 
 // errUnsupportedDirInfoClass is returned when encodeDirRecord has no encoder
 // for the requested class. handleQueryDirectory turns it into

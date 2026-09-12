@@ -31,7 +31,7 @@ func TestResolveNorm_NFDthenNFC(t *testing.T) {
 	}
 
 	// Fast path (exact NFD match) should work.
-	got, ok := ResolveNorm(dir, nfdCafe)
+	got, ok := ResolveNorm(dir, nfdCafe, false)
 	if !ok {
 		t.Error("ResolveNorm: exact NFD lookup should succeed")
 	}
@@ -40,7 +40,7 @@ func TestResolveNorm_NFDthenNFC(t *testing.T) {
 	}
 
 	// Slow path (NFC request → NFD on disk) should also work.
-	got2, ok2 := ResolveNorm(dir, nfcCafe)
+	got2, ok2 := ResolveNorm(dir, nfcCafe, false)
 	if !ok2 {
 		t.Error("ResolveNorm: NFC lookup for NFD-on-disk should succeed")
 	}
@@ -64,7 +64,7 @@ func TestResolveNorm_NFCthenNFD(t *testing.T) {
 	}
 
 	// Lookup via NFD form.
-	got, ok := ResolveNorm(dir, nfdCafe)
+	got, ok := ResolveNorm(dir, nfdCafe, false)
 	if !ok {
 		t.Error("ResolveNorm: NFD lookup for NFC-on-disk should succeed")
 	}
@@ -82,7 +82,7 @@ func TestResolveNorm_ExactASCII(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := ResolveNorm(dir, "hello.txt")
+	got, ok := ResolveNorm(dir, "hello.txt", false)
 	if !ok || got != "hello.txt" {
 		t.Errorf("ResolveNorm ascii: ok=%v got=%q", ok, got)
 	}
@@ -91,7 +91,7 @@ func TestResolveNorm_ExactASCII(t *testing.T) {
 // TestResolveNorm_NotFound verifies that a missing entry returns false.
 func TestResolveNorm_NotFound(t *testing.T) {
 	dir := t.TempDir()
-	_, ok := ResolveNorm(dir, "nonexistent.txt")
+	_, ok := ResolveNorm(dir, "nonexistent.txt", false)
 	if ok {
 		t.Error("ResolveNorm: missing file should return false")
 	}
@@ -110,7 +110,7 @@ func TestResolveSecureNorm_DotDotWithinRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ResolveSecureNorm(root, "subdir/../file.txt")
+	got, err := ResolveSecureNorm(root, "subdir/../file.txt", false)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestResolveSecureNorm_DotDotWithinRoot(t *testing.T) {
 func TestResolveSecureNorm_DotDotEscapeRejected(t *testing.T) {
 	root := t.TempDir()
 
-	_, err := ResolveSecureNorm(root, "../escape.txt")
+	_, err := ResolveSecureNorm(root, "../escape.txt", false)
 	if err != ErrTraversal {
 		t.Errorf("expected ErrTraversal, got: %v", err)
 	}
@@ -183,8 +183,8 @@ func TestResolveNorm_MissingNameDoesNotScan(t *testing.T) {
 	}
 	scans := countDirScans(t)
 	for _, name := range names {
-		if got, ok := ResolveNorm(dir, name); ok {
-			t.Errorf("ResolveNorm(%q) = %q, true; want miss", name, got)
+		if got, ok := ResolveNorm(dir, name, false); ok {
+			t.Errorf("ResolveNorm(%q, false) = %q, true; want miss", name, got)
 		}
 	}
 	if *scans != 0 {
@@ -203,7 +203,7 @@ func TestResolveNorm_CrossNormalizationDoesNotScan(t *testing.T) {
 	}
 
 	scans := countDirScans(t)
-	got, ok := ResolveNorm(dir, nfcCafe)
+	got, ok := ResolveNorm(dir, nfcCafe, false)
 	if !ok {
 		t.Fatal("NFC lookup for NFD-on-disk entry should succeed")
 	}
@@ -284,9 +284,9 @@ func TestResolveNorm_ASCIIFoldedOnDisk(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, tc.onDisk), []byte("payload"), 0o644); err != nil {
 				t.Fatalf("create %q: %v", tc.onDisk, err)
 			}
-			got, ok := ResolveNorm(dir, tc.requested)
+			got, ok := ResolveNorm(dir, tc.requested, false)
 			if !ok {
-				t.Fatalf("ResolveNorm(%q) missed the canonically equivalent entry %q",
+				t.Fatalf("ResolveNorm(%q, false) missed the canonically equivalent entry %q",
 					tc.requested, tc.onDisk)
 			}
 			// The returned leaf must actually open the file.
@@ -317,9 +317,9 @@ func TestResolveNorm_PartiallyComposedOnDisk(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, onDisk), []byte("payload"), 0o644); err != nil {
 		t.Fatalf("create partially composed name: %v", err)
 	}
-	got, ok := ResolveNorm(dir, requested)
+	got, ok := ResolveNorm(dir, requested, false)
 	if !ok {
-		t.Fatalf("ResolveNorm(%q) missed partially composed entry %q", requested, onDisk)
+		t.Fatalf("ResolveNorm(%q, false) missed partially composed entry %q", requested, onDisk)
 	}
 	if norm.NFC.String(got) != norm.NFC.String(onDisk) {
 		t.Errorf("got %q, want (normalization-equivalent to) %q", got, onDisk)
@@ -401,7 +401,7 @@ func BenchmarkResolveNormMissing(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := ResolveNorm(dir, "brand-new-file.txt"); ok {
+				if _, ok := ResolveNorm(dir, "brand-new-file.txt", false); ok {
 					b.Fatal("unexpected hit")
 				}
 			}
@@ -421,7 +421,7 @@ func BenchmarkResolveNormMissingASCIIFold(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := ResolveNorm(dir, "Kelvin-Report.txt"); ok {
+				if _, ok := ResolveNorm(dir, "Kelvin-Report.txt", false); ok {
 					b.Fatal("unexpected hit")
 				}
 			}
@@ -441,7 +441,7 @@ func BenchmarkResolveNormExisting(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := ResolveNorm(dir, "existing.txt"); !ok {
+				if _, ok := ResolveNorm(dir, "existing.txt", false); !ok {
 					b.Fatal("expected hit")
 				}
 			}
@@ -459,7 +459,7 @@ func BenchmarkResolveNormCrossNormalization(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := ResolveNorm(dir, nfcCafe); !ok {
+				if _, ok := ResolveNorm(dir, nfcCafe, false); !ok {
 					b.Fatal("expected hit")
 				}
 			}
@@ -485,7 +485,7 @@ func BenchmarkResolveSecureNormMissing(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := ResolveSecureNorm(root, `sub\brand-new-file.txt`); err != nil {
+				if _, err := ResolveSecureNorm(root, `sub\brand-new-file.txt`, false); err != nil {
 					b.Fatal(err)
 				}
 			}

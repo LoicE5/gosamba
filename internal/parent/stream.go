@@ -97,7 +97,7 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 	// Plain ResolveSecure misses a base file stored NFD-encoded (the norm on
 	// macOS) when the client addresses it in NFC, so a stream on such a file
 	// looked like "base does not exist" and the whole open failed.
-	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName)
+	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName, shareFoldsCase(tree))
 	if err != nil {
 		d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 		return true

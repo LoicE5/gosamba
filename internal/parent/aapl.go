@@ -204,6 +204,16 @@ func buildCreateResponseContexts(raw []byte, conn *Connection, tree *Tree, maxAc
 // thing — a client that reads one and not the other must not end up with a
 // contradiction. They therefore both go through shareCaseSensitive, which
 // probes each share's root exactly once and caches the answer.
+//
+// The same probe also has to reach the two places that ACT on case, or the
+// server contradicts itself in a way no bit on the wire can fix: the SMB
+// pattern matcher that answers a lookup (matchSMBPattern, driven by
+// shareCaseSensitive) and the path resolver that answers the open that follows
+// it (vfs.ResolveSecureNorm, driven by shareFoldsCase). Those two used to
+// disagree — the matcher folded case unconditionally, the resolver never did —
+// so on a case-sensitive share a lookup for `foo` found `Foo`, the client was
+// told the file existed, and the CREATE behind it answered STATUS_NO_SUCH_FILE
+// into the client's negative name cache.
 
 const (
 	// fileCaseSensitiveSearch is FILE_CASE_SENSITIVE_SEARCH (MS-FSCC 2.5.1).
@@ -259,6 +269,10 @@ var probeCaseSensitivityFn = probeCaseSensitivity
 type caseProbe struct {
 	once      sync.Once
 	sensitive bool
+	// measured records whether sensitive came from a probe that actually ran
+	// or from caseSensitivityFallback. The wire does not care — both answers
+	// look identical to a client — but the resolver does: see shareFoldsCase.
+	measured bool
 }
 
 var (
@@ -279,6 +293,47 @@ func shareCaseSensitive(tree *Tree) bool {
 	if tree == nil || tree.Share.Path == "" {
 		return caseSensitivityFallback
 	}
+	return shareCaseProbe(tree).sensitive
+}
+
+// shareFoldsCase reports whether the SERVER has to fold letter case itself when
+// it resolves a name in this share. It is passed to vfs.ResolveSecureNorm as
+// foldCase, and it is deliberately NOT the complement of shareCaseSensitive,
+// because three states matter where the wire only has two:
+//
+//  1. Probed case-sensitive. `Foo` and `foo` are different files, the matcher
+//     says so, and the resolver must not paper over it. No folding.
+//
+//  2. Probed case-insensitive. The filesystem folds case before we ever see
+//     the name: the single Lstat vfs.ResolveNorm starts with already resolves
+//     every spelling, and a miss there is conclusive. Folding again would find
+//     nothing the kernel did not, and would cost a full directory read on every
+//     new-file CREATE — the hottest path there is. No folding.
+//
+//  3. Not probed at all (an empty read-only share, an unreadable root). We
+//     still report case-insensitive, because caseSensitivityFallback trades a
+//     redundant client lookup for the risk of aliased page caches — but nothing
+//     underneath is folding for us. This is the ONLY state where the server has
+//     to do it, and the only one that pays a directory read for a name it
+//     cannot otherwise find.
+//
+// Without the third state the matcher would keep telling a client that `foo`
+// names the on-disk `Foo` on a share the resolver then refuses to open, which
+// is precisely the negative-name-cache poisoning this pair of functions exists
+// to prevent.
+func shareFoldsCase(tree *Tree) bool {
+	// IPC$ has no backing filesystem, so there is nothing to fold and nothing
+	// this could ever be asked to resolve.
+	if tree == nil || tree.Share.Path == "" {
+		return false
+	}
+	p := shareCaseProbe(tree)
+	return !p.sensitive && !p.measured
+}
+
+// shareCaseProbe returns the share root's probe entry, running the probe once
+// if it has not run yet. tree must have a backing path.
+func shareCaseProbe(tree *Tree) *caseProbe {
 	root := filepath.Clean(tree.Share.Path)
 
 	caseProbeMu.Lock()
@@ -298,13 +353,15 @@ func shareCaseSensitive(tree *Tree) bool {
 			slog.Default().Warn("case-sensitivity probe failed; reporting case-insensitive",
 				"share", tree.Share.Name, "path", root, "read_only", tree.Share.ReadOnly, "err", err)
 			p.sensitive = caseSensitivityFallback
+			p.measured = false
 			return
 		}
 		p.sensitive = sensitive
+		p.measured = true
 		slog.Default().Debug("case-sensitivity probed",
 			"share", tree.Share.Name, "path", root, "case_sensitive", sensitive)
 	})
-	return p.sensitive
+	return p
 }
 
 // probeCaseSensitivity determines whether root's filesystem is case sensitive.

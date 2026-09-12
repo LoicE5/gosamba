@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -38,8 +39,8 @@ func TestMatchSMBPatternShellMetacharactersAreLiteral(t *testing.T) {
 		"a[b.txt",
 		`back\slash.txt`,
 	} {
-		if !matchSMBPattern(name, name) {
-			t.Errorf("matchSMBPattern(%q, %q) = false, want true", name, name)
+		if !matchSMBPattern(name, name, false) {
+			t.Errorf("matchSMBPattern(%q, %q, false) = false, want true", name, name)
 		}
 		// And prove the old implementation really did fail these, so nobody
 		// reintroduces filepath.Match thinking it was fine.
@@ -94,8 +95,8 @@ func TestMatchSMBPatternLiteralNameAlwaysMatches(t *testing.T) {
 		"\u00e9-precomposed.txt", // NFC
 	}
 	for _, name := range names {
-		if !matchSMBPattern(name, name) {
-			t.Errorf("matchSMBPattern(%q, %q) = false, want true (a literal name must always resolve)", name, name)
+		if !matchSMBPattern(name, name, false) {
+			t.Errorf("matchSMBPattern(%q, %q, false) = false, want true (a literal name must always resolve)", name, name)
 		}
 	}
 }
@@ -105,13 +106,13 @@ func TestMatchSMBPatternLiteralNameAlwaysMatches(t *testing.T) {
 func TestMatchSMBPatternInvalidUTF8LiteralName(t *testing.T) {
 	names := []string{"caf\xe9.txt", "\xff\xfe", "mixed \x80 bytes.bin"}
 	for _, name := range names {
-		if !matchSMBPattern(name, name) {
-			t.Errorf("matchSMBPattern(%q, %q) = false, want true", name, name)
+		if !matchSMBPattern(name, name, false) {
+			t.Errorf("matchSMBPattern(%q, %q, false) = false, want true", name, name)
 		}
 	}
 	// Two different invalid bytes must not be conflated (utf8.RuneError would).
-	if matchSMBPattern("a\xe9b", "a\xffb") {
-		t.Error(`matchSMBPattern("a\xe9b", "a\xffb") = true, want false: distinct invalid bytes must not compare equal`)
+	if matchSMBPattern("a\xe9b", "a\xffb", false) {
+		t.Error(`matchSMBPattern("a\xe9b", "a\xffb", false) = true, want false: distinct invalid bytes must not compare equal`)
 	}
 }
 
@@ -186,8 +187,8 @@ func TestMatchSMBPatternWildcards(t *testing.T) {
 		{"***", "", true},
 	}
 	for _, c := range cases {
-		if got := matchSMBPattern(c.pattern, c.name); got != c.want {
-			t.Errorf("matchSMBPattern(%q, %q) = %v, want %v", c.pattern, c.name, got, c.want)
+		if got := matchSMBPattern(c.pattern, c.name, false); got != c.want {
+			t.Errorf("matchSMBPattern(%q, %q, false) = %v, want %v", c.pattern, c.name, got, c.want)
 		}
 	}
 }
@@ -217,8 +218,80 @@ func TestMatchSMBPatternCaseInsensitive(t *testing.T) {
 		{"]", "}", false},
 	}
 	for _, c := range cases {
-		if got := matchSMBPattern(c.pattern, c.name); got != c.want {
-			t.Errorf("matchSMBPattern(%q, %q) = %v, want %v", c.pattern, c.name, got, c.want)
+		if got := matchSMBPattern(c.pattern, c.name, false); got != c.want {
+			t.Errorf("matchSMBPattern(%q, %q, false) = %v, want %v", c.pattern, c.name, got, c.want)
+		}
+	}
+}
+
+// TestMatchSMBPatternCaseSensitive is the other half: on a share whose backing
+// filesystem really distinguishes `Foo` from `foo`, the matcher must too. Every
+// row above that matched only because of folding must now miss, and the
+// wildcard grammar must be untouched by the flag.
+func TestMatchSMBPatternCaseSensitive(t *testing.T) {
+	cases := []struct {
+		pattern string
+		name    string
+		want    bool
+	}{
+		// The defect itself: macOS resolves a single name with a one-entry
+		// QUERY_DIRECTORY whose pattern IS the leaf, so this row deciding
+		// "true" is what told a client that `foo` existed when only `Foo` did.
+		{"foo", "Foo", false},
+		{"Foo", "foo", false},
+		{"foo", "foo", true},
+		{"Foo", "Foo", true},
+
+		{"README.TXT", "readme.txt", false},
+		{"README.TXT", "README.TXT", true},
+		{"ReAdMe.TxT", "rEaDmE.tXt", false},
+		{"*.TXT", "Notes.txt", false},
+		{"*.txt", "Notes.txt", true},
+		{"NOTES.*", "notes.txt", false},
+		{"notes.*", "notes.txt", true},
+		{"IMG[1].JPG", "img[1].jpg", false},
+		{"IMG[1].JPG", "IMG[1].JPG", true},
+		{"ÄÖÜ.txt", "äöü.TXT", false},
+		{"ÄÖÜ.txt", "ÄÖÜ.txt", true},
+		{"ΣΊΣΥΦΟΣ", "σίσυφος", false},
+		{"ПРИВЕТ.txt", "привет.txt", false},
+		// U+212A KELVIN SIGN folds to `k` only when folding is on.
+		{"\u212Aelvin", "kelvin", false},
+		{"\u212Aelvin", "\u212Aelvin", true},
+
+		// The grammar is unaffected by the flag.
+		{"", "Anything", true},
+		{"*", "Anything", true},
+		{"???", "abc", true},
+		{"a?c", "abc", true},
+		{"*a*b*c*", "xxaxxbxxcxx", true},
+		{"*.txt", "notes.txt", true},
+		{`back\slash.txt`, `back\slash.txt`, true},
+	}
+	for _, c := range cases {
+		if got := matchSMBPattern(c.pattern, c.name, true); got != c.want {
+			t.Errorf("matchSMBPattern(%q, %q, true) = %v, want %v", c.pattern, c.name, got, c.want)
+		}
+	}
+}
+
+// TestMatchSMBPatternCaseSensitiveLiteralIsExactComparison states the whole
+// contract for the shape macOS actually sends — a pattern with no
+// metacharacters — in one line: on a case-sensitive share it is byte equality,
+// nothing more.
+func TestMatchSMBPatternCaseSensitiveLiteralIsExactComparison(t *testing.T) {
+	names := []string{
+		"plain.txt", "PLAIN.TXT", "Plain.Txt",
+		"IMG[1].jpg", "img[1].JPG",
+		"naïve café.txt", "NAÏVE CAFÉ.TXT",
+		"Ελληνικά.txt", "ΕΛΛΗΝΙΚΆ.txt",
+		"caf\xe9.txt",
+	}
+	for _, a := range names {
+		for _, b := range names {
+			if got, want := matchSMBPattern(a, b, true), a == b; got != want {
+				t.Errorf("matchSMBPattern(%q, %q, true) = %v, want %v", a, b, got, want)
+			}
 		}
 	}
 }
@@ -249,8 +322,8 @@ func TestMatchSMBPatternLegacyDOSWildcardsAreLiteral(t *testing.T) {
 		{`*"`, "no-extension", false},
 	}
 	for _, c := range cases {
-		if got := matchSMBPattern(c.pattern, c.name); got != c.want {
-			t.Errorf("matchSMBPattern(%q, %q) = %v, want %v", c.pattern, c.name, got, c.want)
+		if got := matchSMBPattern(c.pattern, c.name, false); got != c.want {
+			t.Errorf("matchSMBPattern(%q, %q, false) = %v, want %v", c.pattern, c.name, got, c.want)
 		}
 	}
 }
@@ -260,14 +333,14 @@ func TestMatchSMBPatternLegacyDOSWildcardsAreLiteral(t *testing.T) {
 // refMatchSMBPattern is a deliberately naive, exponential, recursive matcher
 // for the same grammar. It is far too slow to ship and far too simple to be
 // wrong, which makes it the right thing to check the real one against.
-func refMatchSMBPattern(pattern, name []rune) bool {
+func refMatchSMBPattern(pattern, name []rune, caseSensitive bool) bool {
 	if len(pattern) == 0 {
 		return len(name) == 0
 	}
 	switch pattern[0] {
 	case '*':
 		for i := 0; i <= len(name); i++ {
-			if refMatchSMBPattern(pattern[1:], name[i:]) {
+			if refMatchSMBPattern(pattern[1:], name[i:], caseSensitive) {
 				return true
 			}
 		}
@@ -276,15 +349,20 @@ func refMatchSMBPattern(pattern, name []rune) bool {
 		if len(name) == 0 {
 			return false
 		}
-		return refMatchSMBPattern(pattern[1:], name[1:])
+		return refMatchSMBPattern(pattern[1:], name[1:], caseSensitive)
 	default:
 		if len(name) == 0 {
 			return false
 		}
-		if !strings.EqualFold(string(pattern[0]), string(name[0])) {
+		p, n := string(pattern[0]), string(name[0])
+		if caseSensitive {
+			if p != n {
+				return false
+			}
+		} else if !strings.EqualFold(p, n) {
 			return false
 		}
-		return refMatchSMBPattern(pattern[1:], name[1:])
+		return refMatchSMBPattern(pattern[1:], name[1:], caseSensitive)
 	}
 }
 
@@ -324,14 +402,20 @@ func TestMatchSMBPatternAgainstReference(t *testing.T) {
 		pattern := string(pr)
 		for _, nr := range names {
 			name := string(nr)
-			want := refMatchSMBPattern(pr, nr)
-			if got := matchSMBPattern(pattern, name); got != want {
-				t.Fatalf("matchSMBPattern(%q, %q) = %v, reference says %v", pattern, name, got, want)
+			// The pattern alphabet carries `B` and the name alphabet `b`, so
+			// every case combination is enumerated too: this walk proves the
+			// backtracking is complete in BOTH case modes, not just one.
+			for _, caseSensitive := range []bool{false, true} {
+				want := refMatchSMBPattern(pr, nr, caseSensitive)
+				if got := matchSMBPattern(pattern, name, caseSensitive); got != want {
+					t.Fatalf("matchSMBPattern(%q, %q, %v) = %v, reference says %v",
+						pattern, name, caseSensitive, got, want)
+				}
+				checked++
 			}
-			checked++
 		}
 	}
-	if checked < 10000 {
+	if checked < 20000 {
 		t.Fatalf("only %d pattern/name pairs checked, the enumeration is broken", checked)
 	}
 }
@@ -359,7 +443,7 @@ func TestMatchSMBPatternAdversarialTerminates(t *testing.T) {
 	}
 	for _, c := range cases {
 		done := make(chan bool, 1)
-		go func() { done <- matchSMBPattern(c.pattern, c.name) }()
+		go func() { done <- matchSMBPattern(c.pattern, c.name, false) }()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
@@ -367,6 +451,17 @@ func TestMatchSMBPatternAdversarialTerminates(t *testing.T) {
 				c.what, len(c.pattern), len(c.name))
 		}
 	}
+}
+
+// hasCasedLetter reports whether s contains a rune that has an upper- and a
+// lower-case form, i.e. a rune the case flag could possibly act on.
+func hasCasedLetter(s string) bool {
+	for _, r := range s {
+		if unicode.SimpleFold(r) != r {
+			return true
+		}
+	}
+	return false
 }
 
 var globmatchSink bool
@@ -383,11 +478,14 @@ func TestMatchSMBPatternDoesNotAllocate(t *testing.T) {
 		{strings.Repeat("a*", 50) + "b", strings.Repeat("a", 400)},
 	}
 	for _, c := range cases {
-		allocs := testing.AllocsPerRun(200, func() {
-			globmatchSink = matchSMBPattern(c.pattern, c.name)
-		})
-		if allocs != 0 {
-			t.Errorf("matchSMBPattern(%q, %q) allocated %v times per call, want 0", c.pattern, c.name, allocs)
+		for _, caseSensitive := range []bool{false, true} {
+			allocs := testing.AllocsPerRun(200, func() {
+				globmatchSink = matchSMBPattern(c.pattern, c.name, caseSensitive)
+			})
+			if allocs != 0 {
+				t.Errorf("matchSMBPattern(%q, %q, %v) allocated %v times per call, want 0",
+					c.pattern, c.name, caseSensitive, allocs)
+			}
 		}
 	}
 }
@@ -419,42 +517,75 @@ func FuzzMatchSMBPattern(f *testing.F) {
 		if len(pattern) > 4096 || len(name) > 4096 {
 			return
 		}
-		got := matchSMBPattern(pattern, name)
+		got := matchSMBPattern(pattern, name, false)
 
 		// A wildcard-free pattern is just a case-insensitive comparison.
 		if pattern != "" && !strings.ContainsAny(pattern, "*?") &&
 			utf8.ValidString(pattern) && utf8.ValidString(name) {
 			if want := strings.EqualFold(pattern, name); got != want {
-				t.Fatalf("matchSMBPattern(%q, %q) = %v, want %v (literal pattern)", pattern, name, got, want)
+				t.Fatalf("matchSMBPattern(%q, %q, false) = %v, want %v (literal pattern)", pattern, name, got, want)
 			}
+		}
+
+		// And on a case-sensitive share it is plain byte equality — for ANY
+		// bytes, valid UTF-8 or not. That is the property that makes a
+		// one-entry QUERY_DIRECTORY answer exactly what the following CREATE
+		// will answer.
+		if pattern != "" && !strings.ContainsAny(pattern, "*?") {
+			if want := pattern == name; matchSMBPattern(pattern, name, true) != want {
+				t.Fatalf("matchSMBPattern(%q, %q, true) = %v, want %v (literal pattern)",
+					pattern, name, !want, want)
+			}
+		}
+
+		// Case sensitivity can only ever remove matches, never add them.
+		if matchSMBPattern(pattern, name, true) && !got {
+			t.Fatalf("matchSMBPattern(%q, %q, true) matched but the case-insensitive form did not",
+				pattern, name)
 		}
 
 		// Widening the pattern with a star can never lose a match.
 		if got {
-			if !matchSMBPattern(pattern+"*", name) {
-				t.Fatalf("matchSMBPattern(%q, %q) matched but %q did not", pattern, name, pattern+"*")
+			if !matchSMBPattern(pattern+"*", name, false) {
+				t.Fatalf("matchSMBPattern(%q, %q, false) matched but %q did not", pattern, name, pattern+"*")
 			}
-			if !matchSMBPattern("*"+pattern, name) {
-				t.Fatalf("matchSMBPattern(%q, %q) matched but %q did not", pattern, name, "*"+pattern)
+			if !matchSMBPattern("*"+pattern, name, false) {
+				t.Fatalf("matchSMBPattern(%q, %q, false) matched but %q did not", pattern, name, "*"+pattern)
 			}
 		}
 
-		// Small inputs get cross-checked against the exponential reference.
+		// Small inputs get cross-checked against the exponential reference —
+		// once per execution, not once per case mode. The reference really is
+		// exponential (a 17-byte star-heavy pattern already costs seconds), so
+		// calling it twice pushed such inputs past the fuzzer's hang detector.
+		// Both modes are cross-checked against it exhaustively instead by
+		// TestMatchSMBPatternAgainstReference, over 20000+ pattern/name pairs
+		// drawn from an alphabet that carries both cases.
 		if pattern != "" && utf8.ValidString(pattern) && utf8.ValidString(name) &&
 			len(pattern) <= 24 && len(name) <= 24 {
 			pr, nr := []rune(pattern), []rune(name)
-			if want := refMatchSMBPattern(pr, nr); got != want {
-				t.Fatalf("matchSMBPattern(%q, %q) = %v, reference says %v", pattern, name, got, want)
+			if want := refMatchSMBPattern(pr, nr, false); got != want {
+				t.Fatalf("matchSMBPattern(%q, %q, false) = %v, reference says %v", pattern, name, got, want)
+			}
+		}
+
+		// With no cased letter anywhere, the flag cannot make a difference.
+		// This is what covers the case-sensitive mode on the inputs above,
+		// without paying for the reference a second time.
+		if !hasCasedLetter(pattern) && !hasCasedLetter(name) {
+			if matchSMBPattern(pattern, name, true) != got {
+				t.Fatalf("matchSMBPattern(%q, %q): the two case modes disagree although "+
+					"neither string contains a cased letter", pattern, name)
 			}
 		}
 
 		// A pattern of one `?` per rune always matches, and one more never does.
 		runes := utf8.RuneCountInString(name)
 		if utf8.ValidString(name) && runes < 1024 {
-			if !matchSMBPattern(strings.Repeat("?", runes), name) && runes > 0 {
+			if !matchSMBPattern(strings.Repeat("?", runes), name, false) && runes > 0 {
 				t.Fatalf("%q (%d runes) did not match %d question marks", name, runes, runes)
 			}
-			if matchSMBPattern(strings.Repeat("?", runes+1), name) {
+			if matchSMBPattern(strings.Repeat("?", runes+1), name, false) {
 				t.Fatalf("%q (%d runes) matched %d question marks", name, runes, runes+1)
 			}
 		}
@@ -480,7 +611,7 @@ func BenchmarkMatchSMBPattern(b *testing.B) {
 		b.Run(c.what+"/new", func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				globmatchSink = matchSMBPattern(c.pattern, c.name)
+				globmatchSink = matchSMBPattern(c.pattern, c.name, false)
 			}
 		})
 		b.Run(c.what+"/old", func(b *testing.B) {
@@ -506,7 +637,7 @@ func BenchmarkQueryDirFilter(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			n := 0
 			for _, name := range names {
-				if matchSMBPattern(target, name) {
+				if matchSMBPattern(target, name, false) {
 					n++
 				}
 			}
@@ -530,7 +661,7 @@ func BenchmarkQueryDirFilter(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			n := 0
 			for _, name := range names {
-				if matchSMBPattern("*.jpg", name) {
+				if matchSMBPattern("*.jpg", name, false) {
 					n++
 				}
 			}

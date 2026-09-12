@@ -943,17 +943,28 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		return true
 	}
 
-	// Granted-access mask reported back via FileAccessInformation /
-	// FileAllInformation. macOS derives mode bits from this and refuses to
-	// LIST a directory whose mask doesn't include FILE_LIST_DIRECTORY
-	// (= FILE_READ_DATA) — even when the CREATE itself succeeded. Match what
-	// Samba does: report the full per-share max access regardless of what
-	// the client asked for in CREATE. RW shares get FILE_ALL_ACCESS; RO
-	// shares get FILE_GENERIC_READ|FILE_GENERIC_EXECUTE.
-	var granted uint32 = 0x001F01FF // FILE_ALL_ACCESS
-	if tree.Share.ReadOnly {
-		granted = 0x001200A9 // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
-	}
+	// Granted-access mask, reported back both in the MxAc create context and
+	// via FileAccessInformation / FileAllInformation.
+	//
+	// It is deliberately NOT narrowed to what the client asked for in CREATE —
+	// Samba reports the maximum too, and macOS refuses to LIST a directory
+	// whose mask lacks FILE_LIST_DIRECTORY (= FILE_READ_DATA) even when the
+	// CREATE itself succeeded.
+	//
+	// It IS narrowed to what this object's POSIX permissions really grant. For
+	// macOS the MxAc mask is the only input to smbfs_vnop_access(): the client
+	// never asks for FileAccessInformation separately, so a share-wide constant
+	// made access(W_OK) answer true on a mode 0444 file (the write then failing
+	// with EACCES) and marked every file on the share executable — the AAPL
+	// reply declares the server UNIX-based, so the client takes the execute bit
+	// at face value instead of falling back to "readable implies executable".
+	// That also contradicted the POSIX mode the AAPL directory overlay ships,
+	// so ls -l and access() disagreed about the same file.
+	//
+	// The share's read-only flag remains the ceiling; permissions only subtract
+	// from it, so a read-only share still reports no write access for a mode
+	// 0666 file.
+	granted := maximalAccess(osPath, tree.Share.ReadOnly)
 
 	open := &Open{
 		Path:          osPath,

@@ -1847,15 +1847,8 @@ func (d *Dispatcher) handleQueryDirectory(rw io.ReadWriter, hdr smb2.Header, bod
 	return true
 }
 
-// matchSMBPattern matches name against an SMB glob pattern, case-insensitively.
-// Supports `*` and `?`. Empty pattern means match all.
-func matchSMBPattern(pattern, name string) bool {
-	if pattern == "" || pattern == "*" {
-		return true
-	}
-	ok, _ := filepath.Match(strings.ToLower(pattern), strings.ToLower(name))
-	return ok
-}
+// matchSMBPattern lives in wildcard.go: SMB search patterns use the DOS
+// grammar (only `*` and `?` are metacharacters), not shell globbing.
 
 // errUnsupportedDirInfoClass is returned when encodeDirRecord has no encoder
 // for the requested class. handleQueryDirectory turns it into

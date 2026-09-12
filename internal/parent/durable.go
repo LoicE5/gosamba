@@ -242,6 +242,24 @@ func (e *durableEntry) expired(now time.Time) bool {
 // The order matters: releaseAll's key lookup does an Fstat on the fd, which
 // fails — and then silently no-ops — once the file is closed.
 func releaseOpen(o *Open) {
+	if o == nil {
+		return
+	}
+	// Every caller of releaseOpen is disposing of the handle permanently —
+	// durable expiry, a superseded detached entry, lazy eviction — so its
+	// share-mode reservation dies with it. The one path that is NOT a disposal,
+	// a DH2C/DHnC reclaim, uses releaseOpenKeepShareMode instead and hands the
+	// reservation to the replacement handle.
+	sharedShareModes.release(o)
+	releaseOpenKeepShareMode(o)
+}
+
+// releaseOpenKeepShareMode is releaseOpen without the share-mode drop: it frees
+// the descriptor and byte-range locks but leaves the open's reservation in the
+// process-global table. Only the durable-reclaim path may use it, and only
+// because it transfers that reservation to the replacement Open (or releases it
+// explicitly if the reclaim fails).
+func releaseOpenKeepShareMode(o *Open) {
 	if o == nil || o.File == nil {
 		return
 	}
@@ -526,7 +544,21 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	// linux OFD locks, which live in the kernel and are unaffected by which
 	// *os.File we're using); this is an accepted darwin limitation. Doing
 	// this also prevents the global lock table from leaking entries.
-	releaseOpen(saved)
+	//
+	// The share-mode reservation is the exception: a reclaimed durable handle
+	// is the SAME open continuing, so it must keep its deny mode rather than
+	// drop it and race some other client for it again. It is handed to the
+	// replacement Open once the reclaim is certain to succeed; the deferred
+	// release below covers every way this function can still bail out, so a
+	// failed reclaim can never strand a reservation on a handle that no longer
+	// exists.
+	releaseOpenKeepShareMode(saved)
+	reclaimed := false
+	defer func() {
+		if !reclaimed {
+			sharedShareModes.release(saved)
+		}
+	}()
 
 	// Re-open the backing file with a fresh descriptor on the same path. The
 	// original *os.File belonged to the dropped connection; we cannot assume
@@ -570,6 +602,13 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	} else {
 		st, _ = os.Lstat(open.Path)
 	}
+
+	// The reclaim is now certain to succeed, so move the saved handle's
+	// share-mode reservation onto the replacement rather than releasing and
+	// re-acquiring it: a transfer never gives up the slot, so no other client
+	// can slip a conflicting deny mode in, and no duplicate entry is created.
+	sharedShareModes.transfer(saved, open)
+	reclaimed = true
 
 	sess.AddOpen(open)
 	// Re-register so a subsequent drop can reclaim again. The reclaim above

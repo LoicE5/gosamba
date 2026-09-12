@@ -72,6 +72,52 @@ type ConnOptions struct {
 	OnAuthenticated func(sess *Session) error
 }
 
+// releaseConnOpens disposes of every handle a dropped connection still owns.
+//
+// It closes each file descriptor that is NOT held by a live durable-table entry
+// and gives up that handle's share-mode reservation. Durable opens are left
+// alone: the table owns their fd so the client can reconnect and reclaim them,
+// and a handle awaiting reclaim is still an open for the purposes of the
+// sharing-access check (MS-SMB2 §3.3.5.9), so it keeps its deny mode until the
+// durable entry expires. Detach starts that countdown — until now the entry was
+// attached to this (live) connection and could not expire, so the sweeper could
+// never close an fd still in use.
+//
+// This is the connection-teardown arm of handle disposal; the others are
+// handleClose, Dispatcher.releaseOpens (TREE_DISCONNECT / LOGOFF / superseded
+// session) and releaseOpen (durable expiry). Every one of them must drop the
+// share-mode reservation: an entry nobody can release leaves the file
+// permanently unopenable by every client, which is worse than the missing
+// check it replaced.
+func releaseConnOpens(sessions *SessionTable, durable *DurableTable) {
+	if sessions == nil {
+		return
+	}
+	sessions.RangeSessions(func(s *Session) {
+		s.RangeOpens(func(o *Open) {
+			if o.File == nil {
+				// No descriptor means no share-mode reservation either: only
+				// real file opens are ever registered (directories, named
+				// streams and IPC$ pipes are exempt), so there is nothing to
+				// release here.
+				return
+			}
+			if o.IsDurable && durable != nil &&
+				durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
+				durable.Detach(o.DurableClientGuid, o.DurableCreateGuid)
+				return
+			}
+			// This handle is gone for good.
+			sharedShareModes.release(o)
+			// Release any byte-range locks this open held before the fd
+			// closes: releaseAll's keyFor does an Fstat on the fd, which
+			// fails (and silently no-ops) once the file is closed.
+			sharedLockManager.releaseAll(o)
+			o.File.Close()
+		})
+	})
+}
+
 // ServeConn drives one TCP connection through SMB2 NEGOTIATE → SESSION_SETUP.
 // Anything beyond SESSION_SETUP returns STATUS_INVALID_PARAMETER (Plan 4).
 func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint32, opts ConnOptions) {
@@ -136,27 +182,7 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		// through it, an *Open and its fd) once the connection is gone — not
 		// even the durable opens deliberately left alive just below.
 		conn.resumeKeys.clear()
-		sessions.RangeSessions(func(s *Session) {
-			s.RangeOpens(func(o *Open) {
-				if o.File == nil {
-					return
-				}
-				// Leave durable opens: the table owns their fd for reclaim.
-				// Detach starts the reclaim countdown — until now the entry was
-				// attached to this (live) connection and could not expire, so
-				// the sweeper could never close an fd still in use.
-				if o.IsDurable && opts.Durable != nil &&
-					opts.Durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
-					opts.Durable.Detach(o.DurableClientGuid, o.DurableCreateGuid)
-					return
-				}
-				// Release any byte-range locks this open held before the fd
-				// closes: releaseAll's keyFor does an Fstat on the fd, which
-				// fails (and silently no-ops) once the file is closed.
-				sharedLockManager.releaseAll(o)
-				o.File.Close()
-			})
-		})
+		releaseConnOpens(sessions, opts.Durable)
 	}()
 	ssHandler := &SessionSetupHandler{
 		Conn:              conn,

@@ -33,7 +33,13 @@ const (
 	StatusBufferOverflow      Status = 0x80000005
 	StatusLockNotGranted      Status = 0xC0000055
 	StatusFileLockConflict    Status = 0xC0000054
-	StatusDiskFull            Status = 0xC000007F
+	// StatusSharingViolation is the mandated answer when a CREATE's
+	// DesiredAccess/ShareAccess pair cannot coexist with an existing open of
+	// the same file (MS-SMB2 §3.3.5.9). It is the ONLY signal a client gets
+	// that a deny mode was refused: macOS maps it to EBUSY, which is what
+	// O_EXLOCK/O_SHLOCK callers test for.
+	StatusSharingViolation Status = 0xC0000043
+	StatusDiskFull         Status = 0xC000007F
 	// StatusInsufficientResources is what a server returns when it refuses to
 	// allocate more per-session state (handles, trees) for a client.
 	StatusInsufficientResources Status = 0xC000009A

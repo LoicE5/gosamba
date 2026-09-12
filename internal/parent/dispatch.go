@@ -671,6 +671,11 @@ func (d *Dispatcher) releaseOpens(opens []*Open) {
 		if d.Conn != nil {
 			d.Conn.resumeKeys.release(o)
 		}
+		// Give up the share-mode reservation first: these handles are gone for
+		// good (the tree, session or connection that owned them is being torn
+		// down), and a reservation nobody can ever release makes the file
+		// permanently unopenable by every client.
+		sharedShareModes.release(o)
 		if o.IsDurable && d.Conn != nil && d.Conn.Durable != nil {
 			d.Conn.Durable.Remove(o.DurableClientGuid, o.DurableCreateGuid)
 		}
@@ -851,6 +856,30 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		return true
 	}
 
+	// Share-access pre-check (MS-SMB2 §3.3.5.9). The authoritative test is the
+	// acquire further down, which runs against the fd we actually opened and is
+	// atomic with recording our own reservation. This earlier pass exists only
+	// so that a CREATE which is going to be refused cannot destroy data on its
+	// way out: the three truncating dispositions empty the file below, before
+	// any descriptor is opened, so without it an open that loses the sharing
+	// check would still have wiped a file another client holds exclusively.
+	//
+	// It is deliberately limited to those dispositions. Running it over every
+	// CREATE would replace more specific answers with STATUS_SHARING_VIOLATION —
+	// FILE_CREATE on an existing name must still report
+	// STATUS_OBJECT_NAME_COLLISION — and the non-truncating dispositions have
+	// nothing to protect, since they do not touch the file before the acquire.
+	truncates := req.CreateDisposition == smb2.CreateDispositionOverwrite ||
+		req.CreateDisposition == smb2.CreateDispositionOverwriteIf ||
+		req.CreateDisposition == smb2.CreateDispositionSupersede
+	if truncates && exists && !isDir {
+		if key, ok := shareKeyForPath(osPath); ok &&
+			!sharedShareModes.check(key, req.DesiredAccess, req.ShareAccess) {
+			d.respondError(rw, hdr, smb2.StatusSharingViolation, sess)
+			return true
+		}
+	}
+
 	// Apply disposition logic.
 	createAction := uint32(smb2.CreateActionOpened)
 	switch req.CreateDisposition {
@@ -1011,6 +1040,29 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		}
 		d.respondError(rw, hdr, smb2.StatusInternalError, sess)
 		return true
+	}
+
+	// Reserve this handle's share mode (MS-SMB2 §3.3.5.9). This is the
+	// authoritative check: it is keyed off the descriptor we just opened, so a
+	// rename racing the resolve cannot make us reserve the wrong file, and the
+	// test-and-insert is atomic so two clients racing on the same file cannot
+	// both be admitted.
+	//
+	// It happens after the FileID is minted because every step from here to the
+	// response is infallible — there is no path that could drop the handle and
+	// leave the reservation behind.
+	if shareModeApplies(open) {
+		key, keyOK := shareKeyForFd(int(open.File.Fd()))
+		if keyOK && !sharedShareModes.acquire(key, open, req.DesiredAccess, req.ShareAccess) {
+			// Refused: hand back the descriptor before answering, or the fd
+			// leaks for the life of the process.
+			open.File.Close()
+			open.File = nil
+			d.Log.Debug("create refused: sharing violation",
+				"path", osPath, "access", req.DesiredAccess, "share_access", req.ShareAccess)
+			d.respondError(rw, hdr, smb2.StatusSharingViolation, sess)
+			return true
+		}
 	}
 	sess.AddOpen(open)
 
@@ -1544,6 +1596,12 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
+	// Drop the share-mode reservation before anything below can return early.
+	// CLOSE has several error exits (a failed stream flush, a failed
+	// delete-on-close) and the handle is out of the session table on every one
+	// of them, so releasing anywhere else would leak the entry on those paths
+	// and leave the file unopenable by every client.
+	sharedShareModes.release(open)
 	// Closing the directory handle must complete any CHANGE_NOTIFY watching it
 	// (MS-SMB2 §3.3.5.19), otherwise the client waits on a handle that is gone.
 	d.cancelNotifiesForOpens([]*Open{open})

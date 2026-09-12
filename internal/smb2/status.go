@@ -71,4 +71,11 @@ const (
 	// the server ever granted. STATUS_NOT_SUPPORTED is not in that list, and
 	// Windows/Samba clients branch on the listed codes.
 	StatusInvalidOplockProtocol Status = 0xC00000E3
+
+	// StatusInvalidViewSize is what MS-SMB2 §3.3.5.15.6 mandates for a
+	// server-side copy whose chunk names a source range running past the end of
+	// the source file. It is deliberately not STATUS_INVALID_PARAMETER: that
+	// status carries the "here are my chunk limits, retry smaller" meaning, and a
+	// client that reads an out-of-range refusal as a limit hint retries forever.
+	StatusInvalidViewSize Status = 0xC000001F
 )

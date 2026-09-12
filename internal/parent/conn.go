@@ -131,6 +131,11 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		if dispatcher != nil {
 			dispatcher.CancelAllNotifies()
 		}
+		// Drop every server-side-copy resume key this connection issued. They
+		// are capabilities naming open handles, so nothing may hold one (or,
+		// through it, an *Open and its fd) once the connection is gone — not
+		// even the durable opens deliberately left alive just below.
+		conn.resumeKeys.clear()
 		sessions.RangeSessions(func(s *Session) {
 			s.RangeOpens(func(o *Open) {
 				if o.File == nil {

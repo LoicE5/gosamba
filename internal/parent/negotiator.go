@@ -26,6 +26,23 @@ type Connection struct {
 	// it so a single request can't drive an unbounded allocation.
 	MaxIOSize uint32
 
+	// NegotiatedCapabilities and NegotiatedSecurityMode are the exact
+	// Capabilities and SecurityMode values this connection put on the wire in
+	// its NEGOTIATE response. They are recorded here — rather than recomputed
+	// wherever they are needed again — because FSCTL_VALIDATE_NEGOTIATE_INFO
+	// has to echo them back byte for byte: the client saved the NEGOTIATE
+	// values and compares Capabilities, ServerGuid, SecurityMode and Dialect
+	// to spot a downgrade. Two independent computations of "what we sent"
+	// drift the moment either side of the server changes, and the client reads
+	// drift as an attack (macOS: EAUTH at mount, ENOTCONN on reconnect).
+	NegotiatedCapabilities smb2.Capabilities
+	NegotiatedSecurityMode uint16
+
+	// resumeKeys maps SRV_RESUME_KEYs issued by FSCTL_SRV_REQUEST_RESUME_KEY
+	// to the opens they name, for FSCTL_SRV_COPYCHUNK. It lives on the
+	// connection so the keys die with it; see copychunk.go.
+	resumeKeys resumeKeyTable
+
 	// AAPLReadDirAttr latches once the client has negotiated AAPL with
 	// SUPPORTS_READ_DIR_ATTR. Subsequent QUERY_DIRECTORY level-37 responses
 	// then overlay Apple metadata (max_access, rfork_size, FinderInfo,
@@ -127,11 +144,17 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 		caps |= smb2.CapEncryption
 	}
 
+	// Record what we are about to advertise before encoding it, so
+	// FSCTL_VALIDATE_NEGOTIATE_INFO echoes these exact values instead of a
+	// second, independently-derived guess at them.
+	conn.NegotiatedSecurityMode = secMode
+	conn.NegotiatedCapabilities = caps
+
 	respBody := smb2.NegotiateResponse{
-		SecurityMode:    secMode,
+		SecurityMode:    conn.NegotiatedSecurityMode,
 		Dialect:         sel.Dialect,
 		ServerGuid:      conn.ServerGuid,
-		Capabilities:    caps,
+		Capabilities:    conn.NegotiatedCapabilities,
 		MaxTransactSize: maxIO,
 		MaxReadSize:     maxIO,
 		MaxWriteSize:    maxIO,

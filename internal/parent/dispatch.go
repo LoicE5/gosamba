@@ -666,6 +666,11 @@ func (d *Dispatcher) releaseOpens(opens []*Open) {
 		if o == nil {
 			continue
 		}
+		// A server-side-copy resume key is a capability naming this handle; it
+		// must not outlive it on any teardown path.
+		if d.Conn != nil {
+			d.Conn.resumeKeys.release(o)
+		}
 		if o.IsDurable && d.Conn != nil && d.Conn.Durable != nil {
 			d.Conn.Durable.Remove(o.DurableClientGuid, o.DurableCreateGuid)
 		}
@@ -1542,6 +1547,11 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 	// Closing the directory handle must complete any CHANGE_NOTIFY watching it
 	// (MS-SMB2 §3.3.5.19), otherwise the client waits on a handle that is gone.
 	d.cancelNotifiesForOpens([]*Open{open})
+	// Retire any server-side-copy resume key issued for this handle: the key is
+	// a capability to read the file behind it, so it dies with the handle.
+	if d.Conn != nil {
+		d.Conn.resumeKeys.release(open)
+	}
 	// A clean CLOSE of a durable handle means it is no longer reclaimable —
 	// drop its durable-table entry (a dropped connection, by contrast, leaves
 	// it for reclaim until expiry).
@@ -2562,22 +2572,30 @@ func (d *Dispatcher) handleIoctl(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		// stops asking. Some old clients use STATUS_NOT_FOUND here too.
 		d.respondError(rw, hdr, smb2.StatusFsDriverRequired, sess)
 		return true
-	case smb2.FsctlSrvCopyChunk, smb2.FsctlSrvRequestResumeKey, smb2.FsctlPipeWait:
+	case smb2.FsctlPipeWait:
 		// Decline gracefully so clients fall back to read+write.
 		d.respondError(rw, hdr, smb2.StatusNotSupported, sess)
 		return true
+	case smb2.FsctlSrvRequestResumeKey:
+		return d.handleResumeKey(rw, hdr, req, sess)
+	case smb2.FsctlSrvCopyChunk, smb2.FsctlSrvCopyChunkWrite:
+		return d.handleCopyChunk(rw, hdr, req, sess)
 	case smb2.FsctlValidateNegotiateInfo:
-		// Echo back a minimal response confirming we agree on the negotiate info.
-		// Body: Capabilities(4) + ClientGuid(16) + SecurityMode(2) + Dialect(2)
-		out := make([]byte, 24)
-		binary.LittleEndian.PutUint32(out[0:], 0)
-		copy(out[4:20], d.Conn.ServerGuid[:])
-		binary.LittleEndian.PutUint16(out[20:], 1) // signing enabled
-		binary.LittleEndian.PutUint16(out[22:], uint16(d.Conn.Selection.Dialect))
+		// Repeat, byte for byte, what this connection's NEGOTIATE response put
+		// on the wire. The client saved those four values at negotiate time and
+		// compares every one of them here to detect a downgrade; the macOS
+		// client fails with EAUTH (a failed mount, or ENOTCONN mid-reconnect)
+		// on any mismatch. The values are read back off the Connection rather
+		// than recomputed so the two can never drift apart.
 		resp := smb2.EncodeIoctlResponse(smb2.IoctlResponse{
-			CtlCode:      req.CtlCode,
-			FileID:       req.FileID,
-			OutputBuffer: out,
+			CtlCode: req.CtlCode,
+			FileID:  req.FileID,
+			OutputBuffer: smb2.EncodeValidateNegotiateInfoResponse(smb2.ValidateNegotiateInfoResponse{
+				Capabilities: d.Conn.NegotiatedCapabilities,
+				Guid:         d.Conn.ServerGuid,
+				SecurityMode: d.Conn.NegotiatedSecurityMode,
+				Dialect:      d.Conn.Selection.Dialect,
+			}),
 		})
 		d.respondSuccess(rw, hdr, sess, resp)
 		return true

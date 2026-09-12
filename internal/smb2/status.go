@@ -33,7 +33,13 @@ const (
 	StatusBufferOverflow      Status = 0x80000005
 	StatusLockNotGranted      Status = 0xC0000055
 	StatusFileLockConflict    Status = 0xC0000054
-	StatusDiskFull            Status = 0xC000007F
+	// StatusSharingViolation is the mandated answer when a CREATE's
+	// DesiredAccess/ShareAccess pair cannot coexist with an existing open of
+	// the same file (MS-SMB2 §3.3.5.9). It is the ONLY signal a client gets
+	// that a deny mode was refused: macOS maps it to EBUSY, which is what
+	// O_EXLOCK/O_SHLOCK callers test for.
+	StatusSharingViolation Status = 0xC0000043
+	StatusDiskFull         Status = 0xC000007F
 	// StatusInsufficientResources is what a server returns when it refuses to
 	// allocate more per-session state (handles, trees) for a client.
 	StatusInsufficientResources Status = 0xC000009A
@@ -63,4 +69,27 @@ const (
 	// (MS-SMB2 §3.3.5.18). Answering STATUS_NO_MORE_FILES instead silently
 	// truncates the listing.
 	StatusInfoLengthMismatch Status = 0xC0000004
+
+	// StatusInvalidOplockProtocol is one of the three statuses MS-SMB2
+	// §3.3.5.22 lists for an SMB2 OPLOCK_BREAK the server cannot honour
+	// (alongside STATUS_INVALID_PARAMETER and STATUS_FILE_CLOSED). It is the
+	// right answer for a break acknowledgement that matches no oplock or lease
+	// the server ever granted. STATUS_NOT_SUPPORTED is not in that list, and
+	// Windows/Samba clients branch on the listed codes.
+	StatusInvalidOplockProtocol Status = 0xC00000E3
+
+	// StatusNotFound is what MS-SMB2 §3.3.5.9.5 mandates for a CREATE that
+	// carries an SMB2_CREATE_TIMEWARP_TOKEN when the share has no previous
+	// versions to open. It is deliberately not OBJECT_NAME_NOT_FOUND: the name
+	// may well exist in the live filesystem — what does not exist is the
+	// requested snapshot, and answering "no such name" would tell a snapshot
+	// mount the share is empty rather than that it has no snapshots.
+	StatusNotFound Status = 0xC0000225
+
+	// StatusInvalidViewSize is what MS-SMB2 §3.3.5.15.6 mandates for a
+	// server-side copy whose chunk names a source range running past the end of
+	// the source file. It is deliberately not STATUS_INVALID_PARAMETER: that
+	// status carries the "here are my chunk limits, retry smaller" meaning, and a
+	// client that reads an out-of-range refusal as a limit hint retries forever.
+	StatusInvalidViewSize Status = 0xC000001F
 )

@@ -9,6 +9,11 @@ import (
 // HeaderSize is the size of the SMB2 sync header.
 const HeaderSize = 64
 
+// NextCommandOffset is where the NextCommand field sits inside the SMB2
+// header. Assembling a compounded response rewrites that one field in an
+// already-encoded header, so it needs the offset rather than a re-encode.
+const NextCommandOffset = 20
+
 const headerStructureSize = 64
 
 // Flags is a bit-set carried in the SMB2 header Flags field.

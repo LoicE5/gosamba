@@ -102,12 +102,14 @@ func VerifyMIC(exportedSessionKey, negotiate, challenge, authenticate []byte, mi
 // AuthenticateLen returns the length of the AUTHENTICATE_MESSAGE that starts at
 // b[0], which is not always len(b).
 //
-// UnwrapNTLM hands back everything from the NTLMSSP signature to the end of the
-// SPNEGO blob, and the last leg of a SPNEGO exchange normally carries a
-// mechListMIC *after* the responseToken that holds the AUTHENTICATE_MESSAGE.
-// Those trailing DER bytes are not part of what the client MIC'd, so they have
-// to be trimmed off before the MIC is recomputed — otherwise every MIC-sending
-// client (i.e. every modern Windows client) would fail to authenticate.
+// The last leg of a SPNEGO exchange normally carries a mechListMIC *after* the
+// responseToken that holds the AUTHENTICATE_MESSAGE. Those trailing DER bytes
+// are not part of what the client MIC'd, so they have to be trimmed off before
+// the MIC is recomputed — otherwise every MIC-sending client (i.e. every modern
+// Windows client) would fail to authenticate. The SPNEGO unwrap now returns the
+// responseToken exactly, so this is a second line of defence, and it still
+// matters for a security buffer that could not be parsed as SPNEGO and was
+// located by scanning for the NTLMSSP signature.
 //
 // The end of the message is the furthest extent of its payload fields; clients
 // lay those out contiguously after the fixed part. A message with no payload at

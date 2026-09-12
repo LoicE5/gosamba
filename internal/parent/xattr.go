@@ -94,6 +94,79 @@ func getxattr(path, name string) ([]byte, error) {
 	return buf[:n], nil
 }
 
+// getxattrSize returns the length in bytes of a single xattr's value without
+// reading it. A missing attribute returns (0, nil). ENOTSUP returns
+// errXattrUnsupported.
+//
+// This exists because callers that only want a size were paying for the value:
+// getxattr issues a sizing Getxattr and then a second one that copies the whole
+// attribute into memory. For an AAPL resource fork that is the entire fork read
+// per directory entry, per QUERY_DIRECTORY, purely to call len() on it.
+func getxattrSize(path, name string) (int, error) {
+	size, err := unix.Getxattr(path, name, nil)
+	if err != nil {
+		if e := classifyXattrErr(err); e != nil {
+			return 0, e
+		}
+		// Attribute not present — same as zero bytes for sizing purposes.
+		return 0, nil
+	}
+	return size, nil
+}
+
+// streamXattrSize returns the byte length of the named stream's content on path
+// without reading the content. A stream that was never written returns
+// (0, nil) — same as readStreamXattr's (nil, nil).
+func streamXattrSize(path, stream string) (int, error) {
+	return getxattrSize(path, streamXattrName(stream))
+}
+
+// afpInfoStreamName is the NTFS stream name of Apple's metadata blob. macOS
+// keeps a file's Finder Info there, and this server persists it like any other
+// ADS stream (user.gosamba.ads.AFP_AfpInfo).
+const afpInfoStreamName = "AFP_AfpInfo"
+
+// finderInfoSize is the size of a Mac FinderInfo + ExtendedFinderInfo pair.
+const finderInfoSize = 32
+
+// afpInfoFinderOffset is where that 32-byte FinderInfo sits inside the 60-byte
+// AFP_AfpInfo blob, after the signature, version, reserved and backup-time
+// fields (Samba's MacExtensions.h struct AFPInfo).
+const afpInfoFinderOffset = 16
+
+// readAFPFinderInfo returns the FinderInfo stored in path's AFP_AfpInfo stream.
+// ok is false when the stream was never written, the filesystem has no xattrs,
+// or the stored blob is too short to hold a FinderInfo — all of which mean
+// "this entry has no Finder Info", which callers report as zeros rather than
+// as an error.
+//
+// This is one Getxattr into a stack buffer rather than the getxattr() helper's
+// size-then-read pair: it runs once per entry of every AAPL directory listing,
+// the blob is a fixed 60 bytes, and the second syscall would only fetch what
+// the first already could have. A blob somehow longer than 60 bytes (ERANGE)
+// falls back to the sizing read so an over-long stream still reports its
+// Finder Info instead of silently reporting none.
+func readAFPFinderInfo(path string) (fi [finderInfoSize]byte, ok bool) {
+	var buf [afpInfoSize]byte
+	n, err := unix.Getxattr(path, streamXattrName(afpInfoStreamName), buf[:])
+	if err != nil {
+		if !errors.Is(err, unix.ERANGE) {
+			return fi, false
+		}
+		blob, gerr := getxattr(path, streamXattrName(afpInfoStreamName))
+		if gerr != nil || len(blob) < afpInfoFinderOffset+finderInfoSize {
+			return fi, false
+		}
+		copy(fi[:], blob[afpInfoFinderOffset:])
+		return fi, true
+	}
+	if n < afpInfoFinderOffset+finderInfoSize {
+		return fi, false
+	}
+	copy(fi[:], buf[afpInfoFinderOffset:])
+	return fi, true
+}
+
 // listXattrNames enumerates all xattr names on path. A filesystem without xattr
 // support returns errXattrUnsupported.
 func listXattrNames(path string) ([]string, error) {
@@ -344,19 +417,28 @@ func encodeFullEaList(eas []eaInfo) []byte {
 // entry per persisted ADS stream. Each entry:
 // NextEntryOffset(4), StreamNameLength(4), StreamSize(8),
 // StreamAllocationSize(8), StreamName (UTF-16LE).
+//
+// A directory has no unnamed data stream, so the ::$DATA entry is omitted for
+// one and only its named streams are reported — macOS keeps Finder metadata
+// (tags, labels, icons) in streams on folders, and `xattr -l <dir>` enumerates
+// them through this list. Returns an empty (not nil) buffer when there is
+// nothing to report, which is a valid "no streams" answer.
 func encodeStreamInfoList(path string, fileSize int64) []byte {
 	type sentry struct {
 		name string
 		size int64
 	}
-	entries := []sentry{{name: "::$DATA", size: fileSize}}
+	var entries []sentry
+	if st, err := os.Lstat(path); err != nil || !st.IsDir() {
+		entries = append(entries, sentry{name: "::$DATA", size: fileSize})
+	}
 	if streams, err := listStreams(path); err == nil {
 		for _, s := range streams {
 			entries = append(entries, sentry{name: ":" + s.Name + ":$DATA", size: int64(s.Size)})
 		}
 	}
 
-	var out []byte
+	out := []byte{}
 	for i, e := range entries {
 		nameU16 := utf16leName(e.name)
 		const fixed = 24

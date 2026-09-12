@@ -16,7 +16,7 @@ func TestMxAcResponseContext(t *testing.T) {
 		{Name: []byte("MxAc"), Data: nil},
 	})
 
-	out := buildCreateResponseContexts(reqCtxs, nil, 0x001F01FF)
+	out := buildCreateResponseContexts(reqCtxs, nil, nil, 0x001F01FF, 0, 0)
 
 	var found bool
 	smb2.IterateCreateContexts(out, func(c smb2.CreateContext) bool {
@@ -40,7 +40,7 @@ func TestMxAcResponseContext(t *testing.T) {
 	}
 
 	// Read-only shares must report the read/execute mask, not full access.
-	outRO := buildCreateResponseContexts(reqCtxs, nil, 0x001200A9)
+	outRO := buildCreateResponseContexts(reqCtxs, nil, nil, 0x001200A9, 0, 0)
 	smb2.IterateCreateContexts(outRO, func(c smb2.CreateContext) bool {
 		if string(c.Name) == "MxAc" {
 			if ma := binary.LittleEndian.Uint32(c.Data[4:]); ma != 0x001200A9 {

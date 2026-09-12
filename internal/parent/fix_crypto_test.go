@@ -70,11 +70,20 @@ func fixCryptoNegotiate(cipher smb2.Cipher) []byte {
 }
 
 // fixCryptoHarness is one negotiated connection plus the handler under test.
+//
+// It is wired the way ServeConn wires a real connection — its own session
+// table, a dispatcher that owns the connection-scoped tables, and a sessionHost
+// registered in a SessionIndex — so PreviousSessionId behaves here exactly as
+// it does in production. index is shared between two harnesses by
+// fixSessionConnectedPair to model two TCP connections on one server.
 type fixCryptoHarness struct {
-	h    *SessionSetupHandler
-	conn *Connection
-	pipe *rwPipe
-	out  *bytes.Buffer
+	h     *SessionSetupHandler
+	conn  *Connection
+	pipe  *rwPipe
+	out   *bytes.Buffer
+	index *SessionIndex
+	host  *sessionHost
+	disp  *Dispatcher
 	// basePreauth is the connection preauth chain right after NEGOTIATE,
 	// snapshotted before any SESSION_SETUP so the expected per-session chains
 	// can be rebuilt without trusting the server's own bookkeeping.
@@ -82,6 +91,15 @@ type fixCryptoHarness struct {
 }
 
 func newFixCryptoHarness(t *testing.T, cipher smb2.Cipher, users []config.UserConfig) *fixCryptoHarness {
+	t.Helper()
+	return newFixCryptoHarnessIndexed(t, cipher, users, NewSessionIndex())
+}
+
+// newFixCryptoHarnessIndexed is newFixCryptoHarness with the server-scoped
+// session index supplied, so two harnesses can model two TCP connections on one
+// server — which is what a cross-connection PreviousSessionId needs.
+func newFixCryptoHarnessIndexed(t *testing.T, cipher smb2.Cipher, users []config.UserConfig,
+	index *SessionIndex) *fixCryptoHarness {
 	t.Helper()
 	in := &bytes.Buffer{}
 	if err := transport.WriteFrame(in, fixCryptoNegotiate(cipher)); err != nil {
@@ -102,16 +120,31 @@ func newFixCryptoHarness(t *testing.T, cipher smb2.Cipher, users []config.UserCo
 		t.Fatalf("drain negotiate response: %v", err)
 	}
 
+	tbl := NewSessionTable()
+	disp := &Dispatcher{
+		Conn:     conn,
+		Sessions: tbl,
+		Log:      lg,
+		locks:    sharedLockManager,
+		async:    &asyncTable{},
+		Index:    index,
+	}
+	host := &sessionHost{sessions: tbl, disp: disp, conn: conn, log: lg}
 	return &fixCryptoHarness{
 		h: &SessionSetupHandler{
 			Conn:     conn,
-			Sessions: NewSessionTable(),
+			Sessions: tbl,
 			Users:    users,
 			Log:      lg,
+			Index:    index,
+			Host:     host,
 		},
 		conn:        conn,
 		pipe:        pipe,
 		out:         out,
+		index:       index,
+		host:        host,
+		disp:        disp,
 		basePreauth: forkPreauth(conn.Preauth),
 	}
 }

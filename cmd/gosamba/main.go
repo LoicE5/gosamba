@@ -134,6 +134,11 @@ func run(args []string) error {
 		// not work under --per-user-privdrop.
 		opts.Durable = parent.NewDurableTable()
 		opts.DurableTimeout = cfg.Server.DurableTimeout
+		// Likewise the session index: one worker process serves exactly one
+		// connection, so "server-scoped" and "connection-scoped" are the same
+		// thing here. PreviousSessionId therefore only reaches a previous
+		// session on this same connection under --per-user-privdrop.
+		opts.Sessions = parent.NewSessionIndex()
 		if err := parent.RunWorker(ctx, log, transport.MaxFrameSize, opts); err != nil {
 			return fmt.Errorf("worker: %w", err)
 		}
@@ -205,6 +210,14 @@ func run(args []string) error {
 	// fds indefinitely. The sweeper stops when the server context is cancelled.
 	durable.StartSweeper(ctx, 30*time.Second)
 
+	// One server-scoped session index, shared the same way. It is what lets a
+	// client whose own side broke reconnect on a NEW TCP connection, name its
+	// old session in PreviousSessionId, and have the server close it —
+	// releasing the descriptors, byte-range locks, share-mode reservations,
+	// resume keys and change-notify watches that would otherwise block the
+	// reconnecting client until the idle reaper ran (MS-SMB2 §3.3.5.5.3).
+	sessionIndex := parent.NewSessionIndex()
+
 	srv := &parent.Listener{
 		Log:      log,
 		MaxFrame: transport.MaxFrameSize,
@@ -212,6 +225,7 @@ func run(args []string) error {
 		Handler: func(ctx context.Context, c net.Conn, lg *slog.Logger, maxFrame uint32) {
 			opts := baseOpts
 			opts.Durable = durable
+			opts.Sessions = sessionIndex
 			parent.ServeConn(ctx, c, lg, maxFrame, opts)
 		},
 	}

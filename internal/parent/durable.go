@@ -30,12 +30,23 @@ var (
 	tagRqLs = []byte("RqLs") // lease request
 )
 
-// Lease state bits (MS-SMB2 §2.2.13.2.8). We only ever grant READ caching.
+// Lease state bits (MS-SMB2 §2.2.13.2.8 "SMB2_CREATE_REQUEST_LEASE",
+// LeaseState field). The order is READ, HANDLE, WRITE — HANDLE is 0x02 and
+// WRITE is 0x04, NOT the other way round. Apple's client header agrees
+// (SMBClient kernel/netsmb/smb_2.h: SMB2_LEASE_READ_CACHING 0x01,
+// SMB2_LEASE_HANDLE_CACHING 0x02, SMB2_LEASE_WRITE_CACHING 0x04).
+//
+// Getting these backwards is not cosmetic: putting WRITE_CACHING on the wire
+// when the intent was HANDLE_CACHING makes macOS clear its write-immediately
+// flag and enable unsafe write-behind caching.
+//
+// We currently only ever grant leaseNone (see applyDurableAndLease), but the
+// values must be right so that any future grant means what it says.
 const (
 	leaseNone          uint32 = 0x00
 	leaseReadCaching   uint32 = 0x01
-	leaseWriteCaching  uint32 = 0x02
-	leaseHandleCaching uint32 = 0x04
+	leaseHandleCaching uint32 = 0x02
+	leaseWriteCaching  uint32 = 0x04
 )
 
 // durableRequest is the parsed result of a fresh durable-handle request
@@ -57,8 +68,16 @@ type durableReconnect struct {
 }
 
 // leaseRequest is the parsed RqLs create context.
+//
+// v1 and v2 share the same context name ("RqLs"), so the only thing that tells
+// them apart is the request data length: 32 bytes is v1
+// (SMB2_CREATE_REQUEST_LEASE, MS-SMB2 §2.2.13.2.8) and 52 bytes is v2
+// (SMB2_CREATE_REQUEST_LEASE_V2, §2.2.13.2.10). The response must use the
+// matching form or the client rejects it — clients treat a v1 response to a v2
+// request as a lease failure, and directory leases are always v2.
 type leaseRequest struct {
 	present bool
+	v2      bool // true when the request arrived in the 52-byte v2 form
 	key     [16]byte
 	state   uint32
 }
@@ -103,9 +122,14 @@ func parseDurableContexts(raw []byte) (durableRequest, durableReconnect, leaseRe
 				copy(dc.fileID[:], c.Data[0:16])
 			}
 		case eqTag(c.Name, tagRqLs):
-			// v1: LeaseKey(16) LeaseState(4) Flags(4) Duration(8); v2 adds more.
+			// v1 (32 bytes): LeaseKey(16) LeaseState(4) LeaseFlags(4)
+			//                LeaseDuration(8)
+			// v2 (52 bytes): ... plus ParentLeaseKey(16) Epoch(2) Reserved(2)
+			// The length is the only discriminator; record it so the response
+			// goes back in the same form (MS-SMB2 §2.2.13.2.8 / §2.2.13.2.10).
 			if len(c.Data) >= 20 {
 				lr.present = true
+				lr.v2 = len(c.Data) >= rqLsV2Size
 				copy(lr.key[:], c.Data[0:16])
 				lr.state = binary.LittleEndian.Uint32(c.Data[16:])
 			}
@@ -139,11 +163,34 @@ func encodeDH2QResponse(timeout uint32, flags uint32) []byte {
 // encodeDHnQResponse builds the DHnQ v1 response context payload: 8 reserved.
 func encodeDHnQResponse() []byte { return make([]byte, 8) }
 
+// RqLs create-context payload sizes. Both the request and the response use
+// these exact lengths; a client that asked with one form and is answered with
+// the other treats the reply as malformed (Apple's SMBClient rejects any RqLs
+// response whose data length is neither 32 nor 52, and flags a version
+// mismatch as a lease failure).
+const (
+	rqLsV1Size = 32 // LeaseKey(16) LeaseState(4) Flags(4) Duration(8)
+	rqLsV2Size = 52 // ... + ParentLeaseKey(16) Epoch(2) Reserved(2)
+)
+
 // encodeRqLsResponse builds an RqLs response echoing the lease key and the
-// granted lease state. We use the v1 (32-byte) form: LeaseKey(16) LeaseState(4)
-// Flags(4) Duration(8).
-func encodeRqLsResponse(key [16]byte, granted uint32) []byte {
-	b := make([]byte, 32)
+// granted lease state, in the same version the client asked with.
+//
+//	v1 (MS-SMB2 §2.2.14.2.10, 32 bytes):
+//	    LeaseKey(16) LeaseState(4) LeaseFlags(4) LeaseDuration(8)
+//	v2 (MS-SMB2 §2.2.14.2.11, 52 bytes):
+//	    ... + ParentLeaseKey(16) Epoch(2) Reserved(2)
+//
+// Because we only ever grant LEASE_NONE, the v2 tail is all zeroes: no parent
+// lease key is echoed and SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET stays clear, so
+// a client will not compare the (absent) parent key, and Epoch 0 is correct for
+// a lease that was never established.
+func encodeRqLsResponse(key [16]byte, granted uint32, v2 bool) []byte {
+	size := rqLsV1Size
+	if v2 {
+		size = rqLsV2Size
+	}
+	b := make([]byte, size)
 	copy(b[0:16], key[:])
 	binary.LittleEndian.PutUint32(b[16:], granted)
 	return b
@@ -195,6 +242,24 @@ func (e *durableEntry) expired(now time.Time) bool {
 // The order matters: releaseAll's key lookup does an Fstat on the fd, which
 // fails — and then silently no-ops — once the file is closed.
 func releaseOpen(o *Open) {
+	if o == nil {
+		return
+	}
+	// Every caller of releaseOpen is disposing of the handle permanently —
+	// durable expiry, a superseded detached entry, lazy eviction — so its
+	// share-mode reservation dies with it. The one path that is NOT a disposal,
+	// a DH2C/DHnC reclaim, uses releaseOpenKeepShareMode instead and hands the
+	// reservation to the replacement handle.
+	sharedShareModes.release(o)
+	releaseOpenKeepShareMode(o)
+}
+
+// releaseOpenKeepShareMode is releaseOpen without the share-mode drop: it frees
+// the descriptor and byte-range locks but leaves the open's reservation in the
+// process-global table. Only the durable-reclaim path may use it, and only
+// because it transfers that reservation to the replacement Open (or releases it
+// explicitly if the reclaim fails).
+func releaseOpenKeepShareMode(o *Open) {
 	if o == nil || o.File == nil {
 		return
 	}
@@ -458,10 +523,18 @@ func durableLookupKey(rec durableReconnect) [16]byte {
 
 // handleDurableReconnect attempts to reclaim a durable open for a DH2C/DHnC
 // reconnect. On success it re-opens the backing file, restores the original
-// FileID into the new session, writes a SUCCESS CREATE response echoing the
-// reconnect context, and returns true. It returns false if no live entry
-// exists (caller then sends OBJECT_NAME_NOT_FOUND).
-func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, sess *Session, tree *Tree, rec durableReconnect) bool {
+// FileID into the new session, writes a SUCCESS CREATE response carrying the
+// response context that the governing spec section prescribes, and returns
+// true. It returns false if no live entry exists (caller then sends
+// OBJECT_NAME_NOT_FOUND).
+//
+// lr is the RqLs create context parsed from the same CREATE. A client that
+// asks to reconnect a durable handle is required to ask for a lease in the
+// same request (Apple's SMBClient builds the two together in
+// smb_smb_2.c: "Requesting a Durable Handle requires that you also request a
+// Lease", and the test covers SMB2_CREATE_DUR_HANDLE_RECONNECT), so for a v2
+// reconnect lr is what the response is built from.
+func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, sess *Session, tree *Tree, rec durableReconnect, lr leaseRequest) bool {
 	if d.Conn == nil || d.Conn.Durable == nil {
 		return false
 	}
@@ -479,14 +552,36 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	// linux OFD locks, which live in the kernel and are unaffected by which
 	// *os.File we're using); this is an accepted darwin limitation. Doing
 	// this also prevents the global lock table from leaking entries.
-	releaseOpen(saved)
+	//
+	// The share-mode reservation is the exception: a reclaimed durable handle
+	// is the SAME open continuing, so it must keep its deny mode rather than
+	// drop it and race some other client for it again. It is handed to the
+	// replacement Open once the reclaim is certain to succeed; the deferred
+	// release below covers every way this function can still bail out, so a
+	// failed reclaim can never strand a reservation on a handle that no longer
+	// exists.
+	releaseOpenKeepShareMode(saved)
+	reclaimed := false
+	defer func() {
+		if !reclaimed {
+			sharedShareModes.release(saved)
+		}
+	}()
 
 	// Re-open the backing file with a fresh descriptor on the same path. The
 	// original *os.File belonged to the dropped connection; we cannot assume
 	// it is still valid, so we always re-open.
+	//
+	// A reclaimed handle is the SAME open continuing, so it also keeps the
+	// symlink it was opened through (LinkPath). The re-open still targets
+	// saved.Path — the link's target, which is what the descriptor must sit on —
+	// but a later DELETE_ON_CLOSE or rename must still act on the link. Dropping
+	// LinkPath here would make a durable reconnect silently re-point those two
+	// operations at the target.
 	open := &Open{
 		FileID:            saved.FileID,
 		Path:              saved.Path,
+		LinkPath:          saved.LinkPath,
 		IsDir:             saved.IsDir,
 		Tree:              tree,
 		GrantedAccess:     saved.GrantedAccess,
@@ -499,6 +594,18 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	if !open.IsDir {
 		f, err := os.OpenFile(open.Path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
 		if err != nil {
+			// Falling back to read-only while still reporting the saved
+			// GrantedAccess would hand the client a handle that lies about
+			// itself: it says it may write, the descriptor cannot, and the
+			// first WRITE fails mid-stream. The client does no post-reclaim
+			// validation, so it would never see it coming. Refuse the reclaim
+			// instead — a failed reconnect makes the client re-open the file
+			// fresh, which is a clean error at a point it can handle.
+			if open.GrantedAccess&durableWriteAccess != 0 {
+				d.Log.Warn("durable reconnect refused: file is no longer writable",
+					"path", open.Path, "share", tree.Share.Name, "err", err)
+				return false
+			}
 			f, err = os.OpenFile(open.Path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 			if err != nil {
 				// The file vanished while detached — treat as no longer
@@ -512,7 +619,32 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 		st, _ = os.Lstat(open.Path)
 	}
 
-	sess.AddOpen(open)
+	// The reclaim is now certain to succeed, so move the saved handle's
+	// share-mode reservation onto the replacement rather than releasing and
+	// re-acquiring it: a transfer never gives up the slot, so no other client
+	// can slip a conflicting deny mode in, and no duplicate entry is created.
+	sharedShareModes.transfer(saved, open)
+	reclaimed = true
+
+	// Held from before publication until the response is built; see the
+	// equivalent comment in handleCreate. This path writes open.IsDurable after
+	// AddOpen, which a concurrent release reads, and reads open.File to build
+	// the response.
+	open.mu.Lock()
+	defer open.mu.Unlock()
+	if !sess.AddOpen(open) {
+		// The session went away while the reclaim was running. The reclaim has
+		// already consumed the durable entry and moved the saved handle's
+		// share-mode reservation onto this Open, so both are ours to give back
+		// — nothing else can reach this handle now. The re-registration below
+		// has not run, so there is no new durable entry either.
+		d.Log.Warn("session torn down under a durable reconnect; releasing the reclaimed handle",
+			"path", open.Path, "share", tree.Share.Name)
+		releaseOpen(open)
+		open.File = nil
+		d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)
+		return true
+	}
 	// Re-register so a subsequent drop can reclaim again. The reclaim above
 	// removed the entry, so the slot is normally free; it can only be taken
 	// again if a racing connection registered the same CreateGuid in between.
@@ -540,14 +672,48 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 		mtime = filetimeFromTime(st.ModTime())
 	}
 
-	// Echo the reconnect context back so the client knows the handle was
-	// reclaimed: DH2C is acknowledged with a DH2Q response context.
+	// Build the response contexts. The two reconnect versions are governed by
+	// different spec sections with different Response Construction phases, so
+	// they do NOT get the same treatment.
+	//
+	// DH2C — MS-SMB2 §3.3.5.9.12 ("Handling the
+	// SMB2_CREATE_DURABLE_HANDLE_RECONNECT_V2 Create Context"). Its Response
+	// Construction phase enumerates exactly two possible contexts, both leases:
+	// SMB2_CREATE_RESPONSE_LEASE_V2 (§2.2.14.2.11) and
+	// SMB2_CREATE_RESPONSE_LEASE (§2.2.14.2.10). It never constructs a durable
+	// handle response, and step 2.14 makes a DH2Q arriving alongside a DH2C an
+	// error — so a DH2Q reply answers a request context the client could not
+	// legally have sent. Apple's SMBClient reaches the same conclusion from the
+	// wire (smb_smb_2.c: "The response to a DH2C seems to be ONLY a RqLs
+	// reply"), and the mistake is not cosmetic there: the client clears
+	// SMB2_DURABLE_HANDLE_RECONNECT only in its RqLs arm, while its DH2Q arm
+	// clears SMB2_DURABLE_HANDLE_REQUEST, which a reconnect never set. Echoing
+	// DH2Q therefore left the client believing the reconnect was still pending
+	// after a reconnect we had in fact granted, and additionally tripped
+	// SMB2_DURABLE_HANDLE_FAIL for the request/response version mismatch.
+	//
+	// DHnC — §3.3.5.9.7 is a different section with its own construction phase,
+	// and Apple observes "a RqLs and DHnQ reply" for it, so v1 keeps its DHnQ
+	// echo unchanged.
 	var echo []smb2.CreateContext
 	if rec.v2 {
-		echo = append(echo, smb2.CreateContext{
-			Name: tagDH2Q,
-			Data: encodeDH2QResponse(uint32(d.Conn.DurableTimeout/time.Millisecond), 0),
-		})
+		if lr.present {
+			// Grant LEASE_NONE, exactly as the fresh-CREATE path does (see
+			// applyDurableAndLease): we implement no lease-break machinery, so
+			// any caching grant would let the client serve stale data. The
+			// lease key is the client's own, from the RqLs it sent with this
+			// reconnect, and the v1/v2 form matches what it asked with.
+			echo = append(echo, smb2.CreateContext{
+				Name: tagRqLs,
+				Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2),
+			})
+		}
+		// No RqLs in the request means no Open.Lease to describe, and
+		// §3.3.5.9.12 gates both of its response contexts on Open.Lease being
+		// non-NULL — so it constructs nothing at all. SUCCESS plus the
+		// reclaimed FileID is then the entire answer, which is what a client
+		// that asked for no lease is waiting for. Inventing a DH2Q here would
+		// reintroduce exactly the context the section refuses to construct.
 	} else {
 		echo = append(echo, smb2.CreateContext{Name: tagDHnQ, Data: encodeDHnQResponse()})
 	}
@@ -632,14 +798,14 @@ func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leas
 		// Grant NO caching (LEASE_NONE). A read-caching lease is a promise that
 		// the server will send a lease break before the file changes under the
 		// client; we implement no lease-break machinery (OPLOCK_BREAK is
-		// answered STATUS_NOT_SUPPORTED and nothing ever sends an unsolicited
-		// break), so a client that trusted a read lease would keep serving
+		// answered STATUS_INVALID_OPLOCK_PROTOCOL and nothing ever sends an
+		// unsolicited break), so a client that trusted a read lease would keep serving
 		// stale data indefinitely whenever another opener — or a process on the
 		// server itself — modified the file. Echoing LEASE_NONE keeps the
 		// client re-reading from the server, which is always correct.
 		ctxs = append(ctxs, smb2.CreateContext{
 			Name: tagRqLs,
-			Data: encodeRqLsResponse(lr.key, leaseNone),
+			Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2),
 		})
 	}
 

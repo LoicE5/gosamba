@@ -26,7 +26,16 @@ var SupportedDialects = []Dialect{Dialect311, Dialect302, Dialect300, Dialect210
 // session keys must be derived at 256 bits (MS-SMB2 §3.1.4.2 uses L=256 for the
 // AES-256 ciphers); see smb3.CipherKeyBits and its use in the session-setup
 // key derivation.
-var SupportedCiphers = []Cipher{CipherAES256GCM, CipherAES128GCM, CipherAES128CCM}
+//
+// All four MS-SMB2 ciphers are listed. AES-256-CCM in particular must not be
+// left out: macOS offers it, and a client configured to offer *only* that
+// cipher would otherwise select nothing here, which makes the negotiate
+// response omit the encryption context entirely. The client does not check for
+// that omission — it keeps its own default of AES-128-CCM — so the two ends end
+// up disagreeing on the cipher and the connection dies on the first transform
+// frame. Advertising every cipher we can actually perform removes the silent
+// mismatch.
+var SupportedCiphers = []Cipher{CipherAES256GCM, CipherAES128GCM, CipherAES256CCM, CipherAES128CCM}
 
 // SupportedSigningAlgos, server preference order. CMAC first because GMAC nonce
 // construction (related-op bit, server-to-client bit per MS-SMB2 §3.1.4.1) has

@@ -97,21 +97,30 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 	// Plain ResolveSecure misses a base file stored NFD-encoded (the norm on
 	// macOS) when the client addresses it in NFC, so a stream on such a file
 	// looked like "base does not exist" and the whole open failed.
-	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName)
+	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName, shareFoldsCase(tree))
 	if err != nil {
 		d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 		return true
 	}
-	st, statErr := os.Lstat(osPath)
-	if statErr != nil {
-		// Streams require a base file. Map missing/permission/traversal to
-		// OBJECT_NAME_NOT_FOUND so the client doesn't retry.
+	// The base object must exist — but it may be a DIRECTORY. macOS opens named
+	// streams on directories to carry Finder metadata (tags, labels, custom
+	// icons): smb2fs_smb_get_create_options() in Apple's smbfs deliberately
+	// omits FILE_DIRECTORY_FILE when a stream name is present, and
+	// smbfs_vnop_setxattr() has no vnode-type guard at all — it only requires
+	// that the share advertise named streams, which this server does. Answering
+	// FILE_IS_A_DIRECTORY here made `xattr -w` (and so every Finder folder tag)
+	// fail with EIO on any folder in the share.
+	//
+	// Nothing downstream needs a file handle: this function never opens the base
+	// object, the stream helpers in xattr.go are path-based (Getxattr/Setxattr/
+	// Removexattr, all valid on a directory), and CLOSE's delete-on-close for a
+	// stream removes only the backing xattr — it returns before the unlink that
+	// serves ordinary handles. Path containment is unaffected: it is enforced by
+	// ResolveSecureNorm above, not by the vnode type.
+	if _, statErr := os.Lstat(osPath); statErr != nil {
+		// Map missing/permission/traversal to OBJECT_NAME_NOT_FOUND so the
+		// client doesn't retry.
 		d.respondError(rw, hdr, smb2.StatusObjectNameNotFound, sess)
-		return true
-	}
-	if st.IsDir() {
-		// Directories don't have $DATA streams. Samba returns FILE_IS_A_DIRECTORY.
-		d.respondError(rw, hdr, smb2.StatusFileIsADirectory, sess)
 		return true
 	}
 
@@ -220,7 +229,20 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		d.respondError(rw, hdr, smb2.StatusInternalError, sess)
 		return true
 	}
-	sess.AddOpen(open)
+	// Held from before publication until the response is built; see the
+	// equivalent comment in handleCreate. A stream handle's response is built
+	// out of open.streamBuf, which a teardown does not touch — but the handle
+	// still has to be unreachable-or-held, never reachable-and-unheld, or the
+	// rule stops being checkable.
+	open.mu.Lock()
+	defer open.mu.Unlock()
+	if !sess.AddOpen(open) {
+		// Torn down under this CREATE. A stream handle is an in-memory buffer
+		// with no descriptor and no share-mode reservation (shareModeApplies
+		// excludes streams), so nothing has to be given back.
+		d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)
+		return true
+	}
 	d.LastCreatedFileID = open.FileID
 	d.HasLastCreated = true
 
@@ -235,7 +257,11 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		AllocationSize: uint64(len(open.streamBuf)),
 		EndOfFile:      uint64(len(open.streamBuf)),
 		FileID:         open.FileID,
-		CreateContexts: buildCreateResponseContexts(req.CreateContexts, d.Conn, maxAccess),
+		// Named-stream handles have no inode of their own, so pass a zero
+		// disk-file-id: buildCreateResponseContexts then omits QFid entirely
+		// instead of reporting an id of zero, which would make macOS drop
+		// File-ID support for the rest of the session.
+		CreateContexts: buildCreateResponseContexts(req.CreateContexts, d.Conn, tree, maxAccess, 0, 0),
 	})
 	d.respondSuccess(rw, hdr, sess, resp)
 	return true

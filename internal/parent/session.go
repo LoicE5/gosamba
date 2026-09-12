@@ -37,6 +37,30 @@ type Open struct {
 	Tree          *Tree
 	DeleteOnClose bool
 
+	// LinkPath is the in-share symlink this CREATE traversed to reach Path,
+	// and is EMPTY on every handle that did not traverse one.
+	//
+	// It exists because the two halves of a handle refer to different objects
+	// once a symlink is involved. Path is the link's TARGET — that is what the
+	// descriptor is open on, what READ and WRITE move bytes through, what
+	// QUERY_INFO reports, what the share-mode and byte-range-lock tables are
+	// keyed by, and what a durable reclaim re-opens. Making it the target is
+	// what made an in-share symlink openable at all (see handleCreate), and it
+	// is deliberate: a handle whose metadata described the link while its data
+	// came from the target would report a size that does not match what READ
+	// returns.
+	//
+	// But the handle's NAME is still the link. DELETE_ON_CLOSE and
+	// FileRenameInformation are namespace operations, and running them against
+	// Path made deleting a symlink over SMB delete the file it pointed at and
+	// renaming one rename the target. POSIX draws the line in exactly this
+	// place: open(2) follows the final symlink, unlink(2) and rename(2) do not.
+	//
+	// Only namePath() reads this field, and only those two operations call
+	// namePath(), so an empty LinkPath leaves every pre-existing code path
+	// working off Path exactly as before.
+	LinkPath string
+
 	// IsStream marks an ephemeral named-alternate-data-stream handle. macOS
 	// uses NTFS stream syntax (foo.txt:com.apple.metadata:_kMDItemUserTags:$DATA)
 	// to write extended attributes. Rather than persist a separate file per
@@ -89,6 +113,26 @@ type Open struct {
 	// READ/WRITE on an ordinary file — which pread/pwrite and touch nothing
 	// here — and exclusive for everything else.
 	mu sync.RWMutex
+}
+
+// namePath returns the path that NAMES this handle in the share's directory
+// tree: the symlink the CREATE traversed, if it traversed one, and otherwise
+// the handle's own path.
+//
+// This is the path the two namespace operations must act on — the unlink behind
+// DELETE_ON_CLOSE and the rename behind FileRenameInformation. Everything else
+// (the descriptor, READ/WRITE, QUERY_INFO, SET_INFO end-of-file, byte-range
+// locks, durable reclaim) deliberately keeps using Path, which is the object the
+// handle actually reads and writes.
+//
+// For a handle that never traversed a symlink — every handle before this change
+// and the overwhelming majority after it — LinkPath is empty and this is just
+// Path.
+func (o *Open) namePath() string {
+	if o.LinkPath != "" {
+		return o.LinkPath
+	}
+	return o.Path
 }
 
 // durableWriteAccess is the set of GrantedAccess bits that promise the client

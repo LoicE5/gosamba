@@ -571,9 +571,17 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	// Re-open the backing file with a fresh descriptor on the same path. The
 	// original *os.File belonged to the dropped connection; we cannot assume
 	// it is still valid, so we always re-open.
+	//
+	// A reclaimed handle is the SAME open continuing, so it also keeps the
+	// symlink it was opened through (LinkPath). The re-open still targets
+	// saved.Path — the link's target, which is what the descriptor must sit on —
+	// but a later DELETE_ON_CLOSE or rename must still act on the link. Dropping
+	// LinkPath here would make a durable reconnect silently re-point those two
+	// operations at the target.
 	open := &Open{
 		FileID:            saved.FileID,
 		Path:              saved.Path,
+		LinkPath:          saved.LinkPath,
 		IsDir:             saved.IsDir,
 		Tree:              tree,
 		GrantedAccess:     saved.GrantedAccess,

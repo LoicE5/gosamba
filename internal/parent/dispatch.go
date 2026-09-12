@@ -981,6 +981,9 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	st, statErr := os.Lstat(osPath)
 	exists := statErr == nil
 	isDir := exists && st.IsDir()
+	// linkPath stays empty unless the branch below actually traverses an
+	// in-share symlink; see Open.LinkPath for why the empty case matters.
+	var linkPath string
 	if !exists && !os.IsNotExist(statErr) {
 		d.Log.Warn("create: lstat failed", "path", osPath, "err", statErr)
 		d.respondError(rw, hdr, statusFromErr(statErr), sess)
@@ -1004,10 +1007,16 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// The target becomes the path of the whole handle, not just of the open:
 	// QUERY_INFO, READ, WRITE and a durable reclaim all work from open.Path,
 	// and a handle whose metadata described the link while its data came from
-	// the target would be a worse bug than the one being fixed. The visible
-	// consequence is that DELETE_ON_CLOSE and rename act on the target rather
-	// than on the link, which is the same illusion the rest of this CREATE
-	// maintains.
+	// the target would be a worse bug than the one being fixed.
+	//
+	// The link itself is NOT forgotten, though. It is kept in open.LinkPath,
+	// because the handle's data and the handle's name refer to different objects
+	// from here on: the data is the target's, the name is still the link's.
+	// DELETE_ON_CLOSE and FileRenameInformation are the two operations that act
+	// on the name, and running them against the target made deleting a symlink
+	// over SMB delete the file it pointed at. POSIX splits it in exactly this
+	// place — open(2) follows the final link, unlink(2) and rename(2) do not —
+	// and so does this server, via Open.namePath().
 	if exists && st.Mode()&os.ModeSymlink != 0 {
 		target, lerr := vfs.ResolveLink(tree.Share.Path, osPath)
 		if lerr != nil {
@@ -1021,6 +1030,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 			d.respondError(rw, hdr, statusFromErr(terr), sess)
 			return true
 		}
+		linkPath = osPath
 		osPath, st, isDir = target, tst, tst.IsDir()
 	}
 
@@ -1231,6 +1241,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 
 	open := &Open{
 		Path:          osPath,
+		LinkPath:      linkPath,
 		IsDir:         isDir,
 		Tree:          tree,
 		GrantedAccess: granted,
@@ -1851,17 +1862,38 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 			d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 			return true
 		}
+		// Lstat, not Stat, so an existing symlink at the destination is judged
+		// as an object in its own right rather than by whatever it points at.
+		// That is the same rule the rename below follows.
 		if !replace {
 			if _, err := os.Lstat(newPath); err == nil {
 				d.respondError(rw, hdr, smb2.StatusObjectNameCollision, sess)
 				return true
 			}
 		}
-		if err := os.Rename(open.Path, newPath); err != nil {
+		// Rename moves the NAME, so for a handle opened through an in-share
+		// symlink it moves the link and leaves the target where it is (see
+		// Open.LinkPath). Renaming open.Path here renamed the target instead,
+		// so `mv link.txt other.txt` over SMB silently renamed the real file
+		// and left the link dangling.
+		//
+		// The destination side needs no special handling and gets none:
+		// ResolveSecureNorm returns the LEXICAL path of a symlink destination
+		// and os.Rename does not follow a symlink at the destination, so
+		// renaming ONTO a link replaces the link and leaves the file that link
+		// pointed at untouched. That is rename(2), and it is the only answer
+		// consistent with the source side above.
+		if err := os.Rename(open.namePath(), newPath); err != nil {
 			d.respondError(rw, hdr, statusFromErr(err), sess)
 			return true
 		}
-		open.Path = newPath
+		// Only the name moved. A link handle keeps reading and writing the same
+		// target, so Path must not be touched — the new name is the link's.
+		if open.LinkPath != "" {
+			open.LinkPath = newPath
+		} else {
+			open.Path = newPath
+		}
 	case smb2.FileFullEaInformation:
 		// Parse the FILE_FULL_EA_INFORMATION list (MS-FSCC §2.4.15) and persist
 		// each EA as a user.* xattr. macOS uses this to seed Versions/Quarantine/
@@ -2017,9 +2049,10 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		// the stream "exists". ENOTSUP (no xattr support) is tolerated silently.
 		//
 		// This branch always returns, which is what keeps delete-on-close of a
-		// stream from ever reaching the os.Remove(open.Path) below: deleting
+		// stream from ever reaching the unlink below: deleting
 		// `dir:com.apple.metadata:...` drops the xattr and leaves the directory
-		// (and, for a file stream, the file) untouched.
+		// (and, for a file stream, the file) untouched. A stream handle never
+		// traverses a symlink either, so its LinkPath is always empty.
 		if open.DeleteOnClose {
 			if err := removeStreamXattr(open.Path, open.StreamName); err != nil && !errors.Is(err, errXattrUnsupported) {
 				// The client asked for the stream to be gone; if it isn't,
@@ -2065,14 +2098,25 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		d.respondSuccess(rw, hdr, sess, smb2.EncodeCloseResponse(resp))
 		return true
 	}
+	deleted := false
 	if open.DeleteOnClose {
+		// Delete the NAME this handle was opened under, which for a handle that
+		// reached its file through an in-share symlink is the link and not the
+		// target (see Open.LinkPath). Unlinking open.Path here is what made
+		// deleting a symlink over SMB delete the file it pointed at — and, for a
+		// link to a directory, delete the directory and everything in it.
+		victim := open.namePath()
 		// Never let DELETE_ON_CLOSE on the tree root remove the shared
 		// directory itself — that would take the whole share offline. The
 		// refusal has to be visible: a SUCCESS here would tell the client the
 		// share directory is gone when it is not.
+		//
+		// Testing the name rather than open.Path is what keeps a symlink
+		// pointing AT the share root deletable: removing that link does not
+		// touch the shared directory, so there is nothing to refuse.
 		if open.Tree != nil && open.Tree.Share.Path != "" &&
-			filepath.Clean(open.Path) == filepath.Clean(open.Tree.Share.Path) {
-			d.Log.Warn("refusing delete-on-close of the share root", "path", open.Path)
+			filepath.Clean(victim) == filepath.Clean(open.Tree.Share.Path) {
+			d.Log.Warn("refusing delete-on-close of the share root", "path", victim)
 			d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 			return true
 		}
@@ -2084,13 +2128,24 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		//
 		// An already-vanished path is not an error: the client's intent (the
 		// name is gone) holds either way.
-		if err := os.Remove(open.Path); err != nil && !os.IsNotExist(err) {
-			d.Log.Warn("delete-on-close failed", "path", open.Path, "err", err)
+		if err := os.Remove(victim); err != nil && !os.IsNotExist(err) {
+			d.Log.Warn("delete-on-close failed", "path", victim, "err", err)
 			d.respondError(rw, hdr, statusFromErr(err), sess)
 			return true
 		}
+		deleted = true
 	}
-	st, _ := os.Lstat(open.Path)
+	// A handle whose name was just removed has no attributes to echo. This used
+	// to fall out of the Lstat below failing, which is no longer guaranteed: when
+	// the name was a symlink, unlinking it leaves open.Path — the target — alive
+	// and well, and stat'ing it would echo the surviving target's size and times
+	// for a file the client has just been told is gone. Leave resp zeroed and let
+	// closeAttribsUsable keep POSTQUERY_ATTRIB off, which is exactly what
+	// happened for every non-symlink delete before.
+	var st os.FileInfo
+	if !deleted {
+		st, _ = os.Lstat(open.Path)
+	}
 	resp := smb2.CloseResponse{}
 	if st != nil {
 		mt := filetimeFromTime(st.ModTime())

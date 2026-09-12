@@ -1555,6 +1555,11 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		// Persist the stream buffer to its backing xattr, or remove it on
 		// delete-on-close. A zero-length buffer still writes an (empty) xattr so
 		// the stream "exists". ENOTSUP (no xattr support) is tolerated silently.
+		//
+		// This branch always returns, which is what keeps delete-on-close of a
+		// stream from ever reaching the os.Remove(open.Path) below: deleting
+		// `dir:com.apple.metadata:...` drops the xattr and leaves the directory
+		// (and, for a file stream, the file) untouched.
 		if open.DeleteOnClose {
 			if err := removeStreamXattr(open.Path, open.StreamName); err != nil && !errors.Is(err, errXattrUnsupported) {
 				// The client asked for the stream to be gone; if it isn't,
@@ -2334,10 +2339,10 @@ func encodeFileInfo(class uint8, info os.FileInfo, o *Open) ([]byte, bool) {
 		return out, true
 	case smb2.FileStreamInformation:
 		// Default ::$DATA entry plus one :<name>:$DATA entry per persisted ADS
-		// stream. Dirs report no streams.
-		if info.IsDir() {
-			return []byte{}, true
-		}
+		// stream. A directory reports only its named streams (it has no unnamed
+		// data stream) — encodeStreamInfoList drops the ::$DATA entry for one,
+		// so a folder carrying Finder metadata enumerates it here instead of
+		// always claiming it has no streams at all.
 		return encodeStreamInfoList(o.Path, info.Size()), true
 	case smb2.FileNameInformation:
 		// FileNameLength(4) + FileName(N) — return basename.

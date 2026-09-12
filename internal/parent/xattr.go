@@ -344,19 +344,28 @@ func encodeFullEaList(eas []eaInfo) []byte {
 // entry per persisted ADS stream. Each entry:
 // NextEntryOffset(4), StreamNameLength(4), StreamSize(8),
 // StreamAllocationSize(8), StreamName (UTF-16LE).
+//
+// A directory has no unnamed data stream, so the ::$DATA entry is omitted for
+// one and only its named streams are reported — macOS keeps Finder metadata
+// (tags, labels, icons) in streams on folders, and `xattr -l <dir>` enumerates
+// them through this list. Returns an empty (not nil) buffer when there is
+// nothing to report, which is a valid "no streams" answer.
 func encodeStreamInfoList(path string, fileSize int64) []byte {
 	type sentry struct {
 		name string
 		size int64
 	}
-	entries := []sentry{{name: "::$DATA", size: fileSize}}
+	var entries []sentry
+	if st, err := os.Lstat(path); err != nil || !st.IsDir() {
+		entries = append(entries, sentry{name: "::$DATA", size: fileSize})
+	}
 	if streams, err := listStreams(path); err == nil {
 		for _, s := range streams {
 			entries = append(entries, sentry{name: ":" + s.Name + ":$DATA", size: int64(s.Size)})
 		}
 	}
 
-	var out []byte
+	out := []byte{}
 	for i, e := range entries {
 		nameU16 := utf16leName(e.name)
 		const fixed = 24

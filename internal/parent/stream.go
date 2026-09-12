@@ -102,16 +102,25 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 		return true
 	}
-	st, statErr := os.Lstat(osPath)
-	if statErr != nil {
-		// Streams require a base file. Map missing/permission/traversal to
-		// OBJECT_NAME_NOT_FOUND so the client doesn't retry.
+	// The base object must exist — but it may be a DIRECTORY. macOS opens named
+	// streams on directories to carry Finder metadata (tags, labels, custom
+	// icons): smb2fs_smb_get_create_options() in Apple's smbfs deliberately
+	// omits FILE_DIRECTORY_FILE when a stream name is present, and
+	// smbfs_vnop_setxattr() has no vnode-type guard at all — it only requires
+	// that the share advertise named streams, which this server does. Answering
+	// FILE_IS_A_DIRECTORY here made `xattr -w` (and so every Finder folder tag)
+	// fail with EIO on any folder in the share.
+	//
+	// Nothing downstream needs a file handle: this function never opens the base
+	// object, the stream helpers in xattr.go are path-based (Getxattr/Setxattr/
+	// Removexattr, all valid on a directory), and CLOSE's delete-on-close for a
+	// stream removes only the backing xattr — it returns before the unlink that
+	// serves ordinary handles. Path containment is unaffected: it is enforced by
+	// ResolveSecureNorm above, not by the vnode type.
+	if _, statErr := os.Lstat(osPath); statErr != nil {
+		// Map missing/permission/traversal to OBJECT_NAME_NOT_FOUND so the
+		// client doesn't retry.
 		d.respondError(rw, hdr, smb2.StatusObjectNameNotFound, sess)
-		return true
-	}
-	if st.IsDir() {
-		// Directories don't have $DATA streams. Samba returns FILE_IS_A_DIRECTORY.
-		d.respondError(rw, hdr, smb2.StatusFileIsADirectory, sess)
 		return true
 	}
 

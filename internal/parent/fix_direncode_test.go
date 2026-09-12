@@ -696,7 +696,17 @@ func TestDirEncode_StreamXattrSizeMatchesRead(t *testing.T) {
 
 // TestDirEncode_AAPLRforkSizeUnchanged drives the real AAPL path end to end and
 // proves the record the size-only probe produces is byte-identical to the one
-// the fork-reading encoder produced, resource-fork size field included.
+// the fork-reading encoder produced — EXCEPT in the two fields the Finder-info
+// fix deliberately changed:
+//
+//	max_access   (EaSize, offset 64)      was a share-wide constant
+//	Finder Info  (ShortName[8..23], 78..93) was always zero
+//
+// Those two are patched into the reference output from expectations derived
+// here — from the entry's own POSIX permissions, and from the AFP_AfpInfo blob
+// this test wrote — and then every byte of every record, resource-fork size
+// field included, is still held to the pre-fix encoder. Nothing is masked out:
+// a drift of one byte anywhere in the layout still fails.
 func TestDirEncode_AAPLRforkSizeUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	names := []string{"a.txt", "b.txt", "c.txt"}
@@ -720,6 +730,21 @@ func TestDirEncode_AAPLRforkSizeUnchanged(t *testing.T) {
 			}
 		}
 	}
+	// Finder Info on one file and one directory, so the patched field is a real
+	// value for some entries and stays zero for the rest. 0755 on the directory
+	// and 0644 on the files also make the per-entry access masks differ.
+	stored := map[string][32]byte{
+		"b.txt": finderInfoBlob([]byte("TEXTttxt"), 0x4000, 0x0010, 0x5F0A1B2C),
+		"sub":   finderInfoBlob([]byte{0, 40, 0, 60, 1, 144, 2, 88}, 0x0100, 0x0002, 0x600DF00D),
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for n, fi := range stored {
+		if err := writeStreamXattr(filepath.Join(dir, n), afpInfoStreamName, afpInfoWith(fi)); err != nil {
+			t.Skipf("writeStreamXattr(AFP_AfpInfo): %v", err)
+		}
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -733,6 +758,17 @@ func TestDirEncode_AAPLRforkSizeUnchanged(t *testing.T) {
 	if gerr != nil || werr != nil {
 		t.Fatalf("err = %v, reference err = %v", gerr, werr)
 	}
+
+	// Patch the reference: max_access from the entry's real POSIX permissions,
+	// Finder Info from the blob written above.
+	dirEncPatchAAPLOverlay(t, want, func(name string) (uint32, [16]byte) {
+		var finder [16]byte
+		if fi, ok := stored[name]; ok {
+			finder = dirEncWantFinderInfo(fi)
+		}
+		return dirEncWantMaxAccess(t, filepath.Join(dir, name)), finder
+	})
+
 	if !bytes.Equal(got, want) {
 		t.Fatalf("AAPL records differ from the reference encoder at byte %d", dirEncFirstDiff(got, want))
 	}
@@ -749,7 +785,75 @@ func TestDirEncode_AAPLRforkSizeUnchanged(t *testing.T) {
 		if size := binary.LittleEndian.Uint64(got[starts[i]+70:]); size != wantSize {
 			t.Fatalf("%s: rfork size = %d, want %d", n, size, wantSize)
 		}
+		// The two patched fields must really have been exercised: an entry
+		// with a stored blob carries non-zero Finder Info, and one without
+		// still carries zeros. Without this the equality check above could
+		// pass on an all-zero patch.
+		nonZero := !bytes.Equal(got[starts[i]+78:starts[i]+94], make([]byte, 16))
+		if _, hasBlob := stored[n]; nonZero != hasBlob {
+			t.Fatalf("%s: finder info non-zero = %v, has a stored blob = %v", n, nonZero, hasBlob)
+		}
 	}
+}
+
+// dirEncPatchAAPLOverlay rewrites, in a reference-encoder buffer, the only two
+// fields the Finder-info fix changed: max_access at offset 64 and the
+// compressed Finder Info at 78..93. Every other byte is left exactly as the
+// pre-fix encoder wrote it, so the equality check around it still covers the
+// whole record layout.
+func dirEncPatchAAPLOverlay(t *testing.T, buf []byte, want func(name string) (uint32, [16]byte)) {
+	t.Helper()
+	starts, names := dirEncWalkChain(t, buf, 104, 60)
+	for i, n := range names {
+		access, finder := want(n)
+		binary.LittleEndian.PutUint32(buf[starts[i]+64:], access)
+		copy(buf[starts[i]+78:starts[i]+94], finder[:])
+	}
+}
+
+// dirEncWantMaxAccess is the mask the overlay must report for path, spelled out
+// from MS-DTYP bit values and answered by faccessat directly rather than by the
+// server's own narrowing helper — so the expectation is independent of the code
+// under test, and holds whatever identity the test runs as (root included).
+func dirEncWantMaxAccess(t *testing.T, path string) uint32 {
+	t.Helper()
+	const (
+		fileAllAccess = uint32(0x001F01FF)
+		// FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_DELETE_CHILD |
+		// FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER
+		writeRights = uint32(0x0002 | 0x0004 | 0x0010 | 0x0040 | 0x0100 | 0x00010000 | 0x00040000 | 0x00080000)
+		execRight   = uint32(0x0020)          // FILE_EXECUTE / FILE_TRAVERSE
+		readRights  = uint32(0x0001 | 0x0008) // FILE_READ_DATA | FILE_READ_EA
+	)
+	permits := func(mode uint32) bool {
+		return unix.Faccessat(unix.AT_FDCWD, path, mode, unix.AT_EACCESS) == nil
+	}
+	want := fileAllAccess
+	if !permits(unix.W_OK) {
+		want &^= writeRights
+	}
+	if !permits(unix.X_OK) {
+		want &^= execRight
+	}
+	if !permits(unix.R_OK) {
+		want &^= readRights
+	}
+	return want
+}
+
+// dirEncWantFinderInfo assembles the 16 bytes the overlay must carry for a
+// stored 32-byte FinderInfo, from the field order smb_smb_2.c parses (type or
+// reserved1, creator, Finder flags, extended Finder flags, date added) and the
+// offsets Apple's smb_2.h documents for the normal Finder Info / Ext Finder
+// Info pair. It is written out longhand here so the expectation does not come
+// from the same code as the answer.
+func dirEncWantFinderInfo(fi [32]byte) [16]byte {
+	var out [16]byte
+	copy(out[0:8], fi[0:8])     // file: type+creator, folder: window rect
+	copy(out[8:10], fi[8:10])   // Finder flags
+	copy(out[10:12], fi[24:26]) // extended Finder flags
+	copy(out[12:16], fi[20:24]) // date added
+	return out
 }
 
 // --- benchmarks ---------------------------------------------------------------

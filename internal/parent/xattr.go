@@ -121,6 +121,52 @@ func streamXattrSize(path, stream string) (int, error) {
 	return getxattrSize(path, streamXattrName(stream))
 }
 
+// afpInfoStreamName is the NTFS stream name of Apple's metadata blob. macOS
+// keeps a file's Finder Info there, and this server persists it like any other
+// ADS stream (user.gosamba.ads.AFP_AfpInfo).
+const afpInfoStreamName = "AFP_AfpInfo"
+
+// finderInfoSize is the size of a Mac FinderInfo + ExtendedFinderInfo pair.
+const finderInfoSize = 32
+
+// afpInfoFinderOffset is where that 32-byte FinderInfo sits inside the 60-byte
+// AFP_AfpInfo blob, after the signature, version, reserved and backup-time
+// fields (Samba's MacExtensions.h struct AFPInfo).
+const afpInfoFinderOffset = 16
+
+// readAFPFinderInfo returns the FinderInfo stored in path's AFP_AfpInfo stream.
+// ok is false when the stream was never written, the filesystem has no xattrs,
+// or the stored blob is too short to hold a FinderInfo — all of which mean
+// "this entry has no Finder Info", which callers report as zeros rather than
+// as an error.
+//
+// This is one Getxattr into a stack buffer rather than the getxattr() helper's
+// size-then-read pair: it runs once per entry of every AAPL directory listing,
+// the blob is a fixed 60 bytes, and the second syscall would only fetch what
+// the first already could have. A blob somehow longer than 60 bytes (ERANGE)
+// falls back to the sizing read so an over-long stream still reports its
+// Finder Info instead of silently reporting none.
+func readAFPFinderInfo(path string) (fi [finderInfoSize]byte, ok bool) {
+	var buf [afpInfoSize]byte
+	n, err := unix.Getxattr(path, streamXattrName(afpInfoStreamName), buf[:])
+	if err != nil {
+		if !errors.Is(err, unix.ERANGE) {
+			return fi, false
+		}
+		blob, gerr := getxattr(path, streamXattrName(afpInfoStreamName))
+		if gerr != nil || len(blob) < afpInfoFinderOffset+finderInfoSize {
+			return fi, false
+		}
+		copy(fi[:], blob[afpInfoFinderOffset:])
+		return fi, true
+	}
+	if n < afpInfoFinderOffset+finderInfoSize {
+		return fi, false
+	}
+	copy(fi[:], buf[afpInfoFinderOffset:])
+	return fi, true
+}
+
 // listXattrNames enumerates all xattr names on path. A filesystem without xattr
 // support returns errXattrUnsupported.
 func listXattrNames(path string) ([]string, error) {

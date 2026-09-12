@@ -2078,6 +2078,198 @@ func supportedDirInfoClass(c uint8) bool {
 	return false
 }
 
+// The per-entry work an AAPL directory listing does, indirected so a test can
+// count what one listing really performs — the same way the vfs package
+// indirects os.ReadDir. Nothing but a test ever reassigns them.
+//
+// Only two of the three touch the filesystem. entryAccessMask is a pure
+// function of the stat the encoder already holds, which is the whole point of
+// it: see dirEntryAccessMask.
+var (
+	entryAccessMask = dirEntryAccessMask
+	entryRforkSize  = streamXattrSize
+	entryFinderInfo = readAFPFinderInfo
+)
+
+// posixIdentity is the identity a directory listing derives its access hints
+// against: the credentials this process is running as.
+//
+// With the per-user privilege-drop worker enabled those ARE the authenticated
+// SMB user's credentials — the worker drops in OnAuthenticated, and a
+// QUERY_DIRECTORY cannot arrive before a session and a tree exist — and without
+// it every user's I/O runs as the one server identity anyway. Either way it is
+// the identity whose permissions decide whether a later READ or WRITE succeeds.
+type posixIdentity struct {
+	uid    uint32
+	gid    uint32
+	groups []uint32
+	root   bool
+}
+
+// currentPosixIdentity reads the process credentials. It is read once per
+// response (see encodeDirEntriesLimited) rather than cached in a package-level
+// variable on purpose: the privilege drop happens IN-PROCESS, so a cache
+// populated before it would keep answering as root for the life of the worker.
+//
+// It is a var so a test can stand in an identity it does not run as; the group
+// and "other" triads are otherwise unreachable from a test that owns every file
+// it creates.
+var currentPosixIdentity = func() posixIdentity {
+	euid, egid := os.Geteuid(), os.Getegid()
+	id := posixIdentity{uid: uint32(euid), gid: uint32(egid), root: euid == 0}
+	if gs, gerr := os.Getgroups(); gerr == nil {
+		id.groups = make([]uint32, 0, len(gs))
+		for _, g := range gs {
+			id.groups = append(id.groups, uint32(g))
+		}
+	}
+	return id
+}
+
+// inGroup reports whether gid is the identity's primary or any supplementary
+// group. Supplementary groups matter: a share whose files belong to a "share"
+// group is the normal deployment, and ignoring them would report every such
+// file through the "other" triad — read-only padlocks all over Finder.
+func (id posixIdentity) inGroup(gid uint32) bool {
+	if id.gid == gid {
+		return true
+	}
+	for _, g := range id.groups {
+		if g == gid {
+			return true
+		}
+	}
+	return false
+}
+
+// permits reports the rights the identity has on a file with permission bits
+// perm owned by uid/gid, by the rule access(2) itself implements: the OWNER
+// triad if the uid matches, else the GROUP triad if the file's group is one of
+// ours, else the OTHER triad. Exactly one triad applies — they are not
+// accumulated, so a mode 0466 file really is read-only to its owner and saying
+// otherwise would over-report.
+func (id posixIdentity) permits(perm, uid, gid uint32) (readable, writable, executable bool) {
+	if id.root {
+		// root bypasses the read and write bits outright. access(2) still
+		// grants X_OK only when SOME execute bit is set, so that one is real.
+		return true, true, perm&0o111 != 0
+	}
+	var bits uint32
+	switch {
+	case id.uid == uid:
+		bits = (perm >> 6) & 7
+	case id.inGroup(gid):
+		bits = (perm >> 3) & 7
+	default:
+		bits = perm & 7
+	}
+	return bits&4 != 0, bits&2 != 0, bits&1 != 0
+}
+
+// dirEntryAccessMask is a listing entry's max_access: the share ceiling
+// narrowed by the POSIX permissions already visible in the stat the encoder
+// holds. It performs NO syscall — info has been stat'ed a few lines earlier in
+// the same I/O slot, and id is read once per response.
+//
+// This deliberately does NOT use maximalAccess() from maxaccess.go, and the
+// split is the point:
+//
+//   - CREATE resolves access once per open and can afford faccessat, which sees
+//     what mode bits cannot — POSIX/NFSv4 ACLs, a read-only mount (EROFS), an
+//     immutable flag. That is the AUTHORITATIVE answer and it stays there.
+//   - This runs once per directory entry, on the hottest path in the server.
+//     Its value is only a hint macOS uses to seed a vnode's max-access cache;
+//     the real check still happens at CREATE, where a wrong hint is corrected.
+//     Three faccessat calls per file to sharpen a hint cost far more than the
+//     hint is worth — ~6 us per call where this was measured, so ~24 us per
+//     entry with the Finder Info read, or ~120 ms of pure syscall time on a
+//     5000-entry directory. This derivation costs single-digit nanoseconds
+//     (BenchmarkDirEntryAccessMask).
+//
+// So this is approximate where the two can disagree: an ACL that grants or
+// denies beyond the mode bits, a read-only mount, or an immutable flag is
+// invisible here. In each case CREATE still reports and enforces the truth.
+func dirEntryAccessMask(info os.FileInfo, id posixIdentity, shareReadOnly bool) uint32 {
+	ceiling := shareAccessCeiling(shareReadOnly)
+	if info == nil {
+		return ceiling
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		// No stat behind this FileInfo — never the case for os.ReadDir on a
+		// unix filesystem. There is nothing to narrow with, so report the
+		// ceiling: the value this field held before it was per-entry, and
+		// never zero.
+		return ceiling
+	}
+	// The permission bits come from os.FileMode.Perm() rather than st.Mode:
+	// they are the same nine bits, spelled in a type that does not change
+	// width between linux (uint32) and darwin (uint16). Only the owner and
+	// group ids need the raw stat.
+	//
+	// narrowAccessMask is maxaccess.go's, unchanged: the mask arithmetic is
+	// shared with the CREATE path so the two can only ever differ in where the
+	// permission answers came from, never in what a given answer means.
+	readable, writable, executable := id.permits(uint32(info.Mode().Perm()), st.Uid, st.Gid)
+	return narrowAccessMask(ceiling, readable, writable, executable)
+}
+
+// Offsets inside the 32-byte FinderInfo/ExtendedFinderInfo blob that Apple's
+// smb_2.h documents as "Normal Finder Info and Extended Finder Info":
+//
+//	struct finder_file_info {          struct finder_folder_info {
+//	    uint32 finder_type;     @0         uint64 reserved1;            @0
+//	    uint32 finder_creator;  @4         uint16 finder_flags;         @8
+//	    uint16 finder_flags;    @8         uint32 old_location;        @10
+//	    uint32 old_location;   @10         uint16 old_view_flags;      @14
+//	    uint16 reserved;       @14         uint32 old_scroll_position; @16
+//	    uint32 reserved2;      @16         uint32 finder_date_added;   @20
+//	    uint32 date_added;     @20         uint16 finder_ext_flags;    @24
+//	    uint16 finder_ext_flags;@24        ...
+//	    ...                            }
+//	}
+//
+// The two layouts put the still-used extended fields at the same offsets, and
+// differ only in what the first eight bytes mean: type+creator for a file, the
+// Finder window rect for a folder. Both are carried through verbatim, so one
+// extraction serves both — which is why this takes no "is it a directory" flag.
+const (
+	finderInfoHeadOff      = 0  // file: type(4)+creator(4); folder: reserved1(8)
+	finderInfoFlagsOff     = 8  // Finder flags (2)
+	finderInfoDateAddedOff = 20 // date added (4)
+	finderInfoExtFlagsOff  = 24 // extended Finder flags (2)
+)
+
+// compressedFinderInfo builds the 16 bytes Apple's READ_DIR_ATTR overlay
+// carries in ShortName[8..23], from the 32-byte FinderInfo stored in the
+// entry's AFP_AfpInfo stream.
+//
+// The wire layout is the order smb_smb_2.c parses (smb2_smb_parse_query_dir_both_dir_info):
+//
+//	file:   type(4)  creator(4)  finder_flags(2)  finder_ext_flags(2)  date_added(4)
+//	folder: reserved1(8)         finder_flags(2)  finder_ext_flags(2)  date_added(4)
+//
+// Note the ext flags come BEFORE date added on the wire even though the struct
+// declarations in smb_2.h list them the other way round; the parser's read
+// order is what is authoritative.
+//
+// Endianness: the client reads each field with md_get_uint*le and then memcpys
+// the parsed struct straight into fa_finder_info, which userland consumes as a
+// native (big-endian) FinderInfo blob. An le-read followed by a native store on
+// a little-endian host preserves the bytes, so every field must go on the wire
+// in exactly the byte order it has on disk. That makes each field a verbatim
+// copy out of the stored blob — no byte swapping anywhere — which is also what
+// keeps this consistent with the non-AAPL path, where the client reads the very
+// same bytes out of the AFP_AfpInfo stream itself.
+func compressedFinderInfo(fi [finderInfoSize]byte) [16]byte {
+	var out [16]byte
+	copy(out[0:8], fi[finderInfoHeadOff:finderInfoHeadOff+8])
+	copy(out[8:10], fi[finderInfoFlagsOff:finderInfoFlagsOff+2])
+	copy(out[10:12], fi[finderInfoExtFlagsOff:finderInfoExtFlagsOff+2])
+	copy(out[12:16], fi[finderInfoDateAddedOff:finderInfoDateAddedOff+4])
+	return out
+}
+
 // encodeDirEntriesLimited packs at most `limit` records (or as many as fit in
 // maxBytes) starting at open.dirSent. When useAAPL is true and infoClass is
 // FileIdBothDirectoryInformation, each record carries the Apple overlay so
@@ -2102,7 +2294,9 @@ func supportedDirInfoClass(c uint8) bool {
 // it. A record is a fixed size per class plus two bytes per UTF-16 code unit of
 // the name, rounded up to 8, so the entry that straddles the end of the buffer
 // is left for the next call instead of being stat'ed, xattr-probed, encoded and
-// then discarded.
+// then discarded. Every per-entry probe the AAPL overlay needs — the access
+// check, the resource-fork sizing and the Finder Info read — therefore belongs
+// in the one slot below the fit check, never above it.
 func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit int, useAAPL bool) (out []byte, consumed, encoded int, err error) {
 	fixed, ok := dirRecordFixedSize(infoClass)
 	if !ok {
@@ -2119,9 +2313,19 @@ func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit in
 		initial = 0
 	}
 	out = make([]byte, 0, initial)
-	maxAccess := uint32(0x001F01FF)
-	if open.Tree != nil && open.Tree.Share.ReadOnly {
-		maxAccess = 0x001200A9
+	// The share ceiling is now only the FALLBACK for max_access: every AAPL
+	// entry reports its own per-file mask below. A probe that cannot answer
+	// keeps the ceiling — never zero, which Apple reads as "this server thinks
+	// we are Windows" (smbfs_smb_2.c) and turns into folders that show as
+	// access denied.
+	readOnlyShare := open.Tree != nil && open.Tree.Share.ReadOnly
+	shareAccess := shareAccessCeiling(readOnlyShare)
+	// The identity the per-entry access hints are derived against, read ONCE
+	// per response — three credential lookups amortised over every record in
+	// it — and not at all for a listing without the Apple overlay.
+	var ident posixIdentity
+	if useAAPL {
+		ident = currentPosixIdentity()
 	}
 	// FILE_NAMES_INFORMATION is NextEntryOffset + FileIndex + FileNameLength +
 	// the name (MS-FSCC §2.4.26) — nothing the stat could fill in. Calling
@@ -2151,16 +2355,56 @@ func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit in
 			}
 			info = fi
 		}
-		var rforkSize uint64
-		if useAAPL && info != nil && !info.IsDir() {
-			// Report the AAPL resource-fork size from its backing ADS xattr.
-			// Only the length is wanted, so size the attribute rather than
-			// reading the whole fork into memory to call len() on it.
-			if n, xerr := streamXattrSize(filepath.Join(open.Path, name), rforkStreamName); xerr == nil {
-				rforkSize = uint64(n)
+		// --- per-entry I/O slot -------------------------------------------
+		// Everything below runs AFTER the fit check, so the entry that
+		// straddles the end of the buffer costs no syscall at all: it is
+		// re-offered on the next call, where its probes would be paid twice
+		// and used once.
+		//
+		// An AAPL entry costs ONE syscall here that it did not cost before:
+		// the getxattr that reads its Finder Info. That is irreducible — a
+		// named attribute is one read — and it is the whole point of the
+		// field. The per-file access mask adds none at all: it is derived from
+		// the stat above. BenchmarkAAPLDirListing measures both separately.
+		var (
+			rforkSize  uint64
+			finderInfo [16]byte
+		)
+		maxAccess := shareAccess
+		if useAAPL && info != nil {
+			entryPath := filepath.Join(open.Path, name)
+			// Per-file maximal access rather than the share-wide constant.
+			// macOS seeds a vnode's max-access cache straight from this field
+			// (smb_smb_2.c sets FA_MAX_ACCESS_VALID from it), so a listing
+			// that answers FILE_ALL_ACCESS for a file the server cannot write
+			// re-introduces exactly the over-reporting the CREATE path stopped
+			// doing. Derived from the stat, never from a syscall of its own;
+			// an answer of zero would be read by macOS as "this server thinks
+			// we are Windows", so it falls back to the share ceiling.
+			if granted := entryAccessMask(info, ident, readOnlyShare); granted != 0 {
+				maxAccess = granted
+			}
+			if !info.IsDir() {
+				// Report the AAPL resource-fork size from its backing ADS
+				// xattr. Only the length is wanted, so size the attribute
+				// rather than reading the whole fork into memory to call
+				// len() on it.
+				if n, xerr := entryRforkSize(entryPath, rforkStreamName); xerr == nil {
+					rforkSize = uint64(n)
+				}
+			}
+			// Real Finder Info out of the AFP_AfpInfo stream. Apple sets
+			// FA_FINDERINFO_VALID from this field unconditionally, so zeros
+			// here do not mean "ask me properly": smbfs_attrlist.c stops
+			// asking, copies the zeros onto the vnode and starts its cache
+			// timer, losing type/creator, the invisible bit, label colour and
+			// date-added — and Finder can write the zeros back. An entry with
+			// no stored blob still ships zeros, which is the honest answer.
+			if raw, ok := entryFinderInfo(entryPath); ok {
+				finderInfo = compressedFinderInfo(raw)
 			}
 		}
-		rec := encodeDirRecord(name, info, infoClass, useAAPL, maxAccess, rforkSize)
+		rec := encodeDirRecordFinderInfo(name, info, infoClass, useAAPL, maxAccess, rforkSize, finderInfo)
 		if rec == nil {
 			return nil, 0, 0, errUnsupportedDirInfoClass
 		}
@@ -2237,9 +2481,22 @@ func dirRecordFixedSize(infoClass uint8) (int, bool) {
 // When useAAPL is true and infoClass is FileIdBothDirectoryInformation, the
 // record overlays Apple's AAPL fields onto the record per Apple's spec
 // (max_access in EaSize, rfork_size+FinderInfo in ShortName, UNIX mode in
-// Reserved2). maxAccess is the per-share maximal access mask reported as
-// max_access. See Samba's smb2_trans2.c SMB_FIND_ID_BOTH_DIRECTORY_INFO case.
+// Reserved2). maxAccess is the maximal access mask reported as max_access. See
+// Samba's smb2_trans2.c SMB_FIND_ID_BOTH_DIRECTORY_INFO case.
+//
+// This form reports no Finder Info; encodeDirRecordFinderInfo takes the
+// compressed 16 bytes for an entry that has some.
 func encodeDirRecord(name string, info os.FileInfo, infoClass uint8, useAAPL bool, maxAccess uint32, rforkSize uint64) []byte {
+	return encodeDirRecordFinderInfo(name, info, infoClass, useAAPL, maxAccess, rforkSize, [16]byte{})
+}
+
+// encodeDirRecordFinderInfo is encodeDirRecord plus the compressed Finder Info
+// the Apple overlay carries in ShortName[8..23]. It is one function rather than
+// a post-encode patch so the whole record layout stays in a single place: the
+// offsets are fixed by MS-FSCC and Apple accumulates a fixed size per class, so
+// a byte written at the wrong offset is a silent corruption, not an error.
+// finderInfo is all zeros for an entry with no stored Finder Info.
+func encodeDirRecordFinderInfo(name string, info os.FileInfo, infoClass uint8, useAAPL bool, maxAccess uint32, rforkSize uint64, finderInfo [16]byte) []byte {
 	nameU16 := utf16leName(name)
 	switch infoClass {
 	case smb2.InfoFileDirectoryInformation:
@@ -2335,8 +2592,8 @@ func encodeDirRecord(name string, info os.FileInfo, infoClass uint8, useAAPL boo
 			// Apple overlay (matches Samba's vfs_fruit + smb2_trans2.c):
 			//  EaSize          = max_access
 			//  ShortNameLength = 24 (Apple writes literal 24 even though spec says 0)
-			//  ShortName[0..7] = rfork_size (always 0 — no resource fork store)
-			//  ShortName[8..23]= compressed FinderInfo (16 bytes of zeros)
+			//  ShortName[0..7] = rfork_size (from the AFP_AfpResource stream)
+			//  ShortName[8..23]= compressed FinderInfo (from AFP_AfpInfo)
 			//  Reserved2       = UNIX mode (low 16 bits)
 			//  FileId          = inode
 			binary.LittleEndian.PutUint32(out[64:], maxAccess)
@@ -2345,7 +2602,9 @@ func encodeDirRecord(name string, info os.FileInfo, infoClass uint8, useAAPL boo
 			// ShortName[0..7] = rfork_size (from the AFP_AfpResource ADS xattr;
 			// 0 when no resource fork is stored).
 			binary.LittleEndian.PutUint64(out[70:], rforkSize)
-			// out[78..93] FinderInfo = 0 (already zero)
+			// ShortName[8..23] = compressed Finder Info, already laid out by
+			// compressedFinderInfo; all zeros when the entry has none stored.
+			copy(out[78:94], finderInfo[:])
 			binary.LittleEndian.PutUint16(out[94:], unixMode)
 			binary.LittleEndian.PutUint64(out[96:], inode)
 		} else if inode != 0 {

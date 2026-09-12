@@ -16,6 +16,14 @@ var aaplTag = []byte("AAPL")
 // MaximalAccess; omitting it makes iOS mount the share read-only.
 var mxAcTag = []byte("MxAc")
 
+// qFidTag is the SMB2_CREATE_QUERY_ON_DISK_ID create-context name ("QFid",
+// 0x51466964 read big-endian). macOS attaches it to every CREATE that actually
+// creates something and stores the returned DiskFileId as the vnode's inode.
+// Dropping the context — or answering it with a zero DiskFileId — makes the
+// client permanently clear FILE_IDS_SUPPORTED for the whole session and fall
+// back to synthesising inode numbers from a hash of the file name.
+var qFidTag = []byte("QFid")
+
 // rforkStreamName is the NTFS stream name macOS/SMB uses for a file's resource
 // fork. We persist it like any other ADS stream (user.gosamba.ads.AFP_AfpResource)
 // and report its size as rfork_size in AAPL directory overlays.
@@ -100,14 +108,16 @@ func buildAAPLResponse(reqData []byte) ([]byte, bool) {
 }
 
 // buildCreateResponseContexts inspects the requested create contexts and
-// returns the contexts we want to ship back: AAPL response (when negotiated)
-// and MxAc/QFid where applicable. Other contexts (RqLs lease, DHnQ/DH2Q
+// returns the contexts we want to ship back: AAPL response (when negotiated),
+// MxAc, and QFid where applicable. Only contexts the client actually asked for
+// are ever emitted: macOS treats an unsolicited/unknown response context name
+// as EBADRPC and fails the CREATE. Other contexts (RqLs lease, DHnQ/DH2Q
 // durable) are intentionally NOT echoed — that's how the server signals
 // "feature declined" to the client without erroring out.
 //
 // When AAPL with READ_DIR_ATTR is negotiated, this latches conn.AAPLReadDirAttr
 // so subsequent QUERY_DIRECTORY calls on this connection emit the Apple block.
-func buildCreateResponseContexts(raw []byte, conn *Connection, maxAccess uint32) []byte {
+func buildCreateResponseContexts(raw []byte, conn *Connection, maxAccess uint32, diskFileID, volumeID uint64) []byte {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -131,6 +141,23 @@ func buildCreateResponseContexts(raw []byte, conn *Connection, maxAccess uint32)
 			binary.LittleEndian.PutUint32(d[0:], 0)
 			binary.LittleEndian.PutUint32(d[4:], maxAccess)
 			out = append(out, smb2.CreateContext{Name: mxAcTag, Data: d[:]})
+		case bytes.Equal(c.Name, qFidTag):
+			// SMB2_CREATE_QUERY_ON_DISK_ID response (MS-SMB2 2.2.14.2.9):
+			// DiskFileId(8) + VolumeId(8) + 16 reserved zero bytes, which must
+			// total EXACTLY 32 — macOS fails the whole CREATE with EBADRPC on
+			// any other DataLength, and that failure is not retried.
+			//
+			// Skip the context entirely when we have no real inode (named
+			// streams, pipes, a failed stat). Answering with a zero DiskFileId
+			// is what makes the client give up on file IDs for the session;
+			// staying silent just leaves it using the handle-derived id.
+			if diskFileID == 0 {
+				break
+			}
+			var q [32]byte
+			binary.LittleEndian.PutUint64(q[0:], diskFileID)
+			binary.LittleEndian.PutUint64(q[8:], volumeID)
+			out = append(out, smb2.CreateContext{Name: qFidTag, Data: q[:]})
 		}
 		return true
 	})

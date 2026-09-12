@@ -235,7 +235,11 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		AllocationSize: uint64(len(open.streamBuf)),
 		EndOfFile:      uint64(len(open.streamBuf)),
 		FileID:         open.FileID,
-		CreateContexts: buildCreateResponseContexts(req.CreateContexts, d.Conn, maxAccess),
+		// Named-stream handles have no inode of their own, so pass a zero
+		// disk-file-id: buildCreateResponseContexts then omits QFid entirely
+		// instead of reporting an id of zero, which would make macOS drop
+		// File-ID support for the rest of the session.
+		CreateContexts: buildCreateResponseContexts(req.CreateContexts, d.Conn, maxAccess, 0, 0),
 	})
 	d.respondSuccess(rw, hdr, sess, resp)
 	return true

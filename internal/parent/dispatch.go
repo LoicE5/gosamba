@@ -1016,9 +1016,22 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		createCtime = filetimeFromTime(bt)
 	}
 
+	// SMB2_CREATE_QUERY_ON_DISK_ID (QFid) wants the real POSIX identity of the
+	// object we just opened. Prefer fstat on the handle (immune to a rename
+	// racing the CREATE); directories have no *os.File here, so fall back to
+	// the lstat we already did. A failed stat leaves both zero, and QFid is
+	// then omitted rather than answered with a zero id.
+	qfidInfo := st
+	if open.File != nil {
+		if fi, ferr := open.File.Stat(); ferr == nil {
+			qfidInfo = fi
+		}
+	}
+	diskFileID, volumeID := unixInodeAndDev(qfidInfo)
+
 	// Register a durable handle and collect the extra response contexts
-	// (DH2Q/DHnQ echo, RqLs lease grant) to append to the AAPL/MxAc set.
-	respCtxs := buildCreateResponseContexts(req.CreateContexts, d.Conn, granted)
+	// (DH2Q/DHnQ echo, RqLs lease grant) to append to the AAPL/MxAc/QFid set.
+	respCtxs := buildCreateResponseContexts(req.CreateContexts, d.Conn, granted, diskFileID, volumeID)
 	respCtxs = d.applyDurableAndLease(open, durReq, leaseReq, respCtxs, sess.User.Name)
 
 	resp := smb2.EncodeCreateResponse(smb2.CreateResponse{
@@ -2484,6 +2497,39 @@ func unixModeAndInode(info os.FileInfo) (uint16, uint64) {
 		return 0, 0
 	}
 	return uint16(st.Mode & 0xFFFF), uint64(st.Ino)
+}
+
+// unixInodeAndDev pulls the inode and device numbers out of os.FileInfo for the
+// SMB2_CREATE_QUERY_ON_DISK_ID (QFid) response context. Returns (0, 0) for
+// FileInfo implementations that don't expose syscall.Stat_t (synthetic stream
+// handles), which is the caller's signal to omit the context entirely.
+func unixInodeAndDev(info os.FileInfo) (uint64, uint64) {
+	if info == nil {
+		return 0, 0
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return 0, 0
+	}
+	return uint64(st.Ino), devToUint64(st.Dev)
+}
+
+// devToUint64 widens a st_dev to uint64 without sign-extending. The concrete
+// type of syscall.Stat_t.Dev differs per platform (int32 on darwin, uint64 on
+// linux), so this goes through an interface type switch rather than needing a
+// per-GOOS file.
+func devToUint64(dev any) uint64 {
+	switch v := dev.(type) {
+	case int32:
+		return uint64(uint32(v))
+	case uint32:
+		return uint64(v)
+	case int64:
+		return uint64(v)
+	case uint64:
+		return v
+	}
+	return 0
 }
 
 const filetimeEpochDelta = 11644473600

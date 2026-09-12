@@ -170,6 +170,13 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		RequireEncryption: opts.RequireEncryption,
 		RequireSigning:    opts.RequireSigning,
 	}
+	// A reconnecting client names the session it is replacing in
+	// PreviousSessionId; tearing that session's handles down is the same work
+	// LOGOFF does, so it runs through the dispatcher (which also cancels its
+	// CHANGE_NOTIFY watches and releases its byte-range locks).
+	ssHandler.ClosePreviousSession = func(prev *Session) {
+		dispatcher.releaseOpens(prev.TakeAllOpens())
+	}
 
 	for {
 		// Bound how long a connection may sit without sending a complete frame.

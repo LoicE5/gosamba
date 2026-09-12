@@ -57,7 +57,8 @@ type Open struct {
 	// GrantedAccess is the access mask the CREATE actually granted on this
 	// handle. Reported back via FileAccessInformation / FileAllInformation —
 	// macOS reads this to decide whether to even attempt READ/WRITE/QUERY_DIR
-	// on the handle.
+	// on the handle. See durableWriteAccess for the bits that oblige the
+	// server to keep a writable descriptor behind the handle.
 	GrantedAccess uint32
 
 	// Durable handle bookkeeping. When IsDurable is set, this Open is
@@ -78,6 +79,15 @@ type Open struct {
 	dirSent    int
 	dirRestart bool
 }
+
+// durableWriteAccess is the set of GrantedAccess bits that promise the client
+// it may modify the file through this handle. A handle carrying any of them
+// must sit on a writable descriptor: the client trusts the granted mask and
+// issues WRITE / SET_INFO without re-checking, so a read-only descriptor behind
+// such a mask surfaces as a failure mid-transfer rather than at open time.
+// It is the same set of bits handleCreate treats as "wants write".
+const durableWriteAccess = smb2.AccessFileWriteData | smb2.AccessFileAppendData |
+	smb2.AccessGenericWrite | smb2.AccessGenericAll
 
 // Session holds per-SMB-session state once auth completes.
 type Session struct {
@@ -367,6 +377,14 @@ type SessionSetupHandler struct {
 	// outright, because the client keeps sending in the clear and every
 	// request is denied.
 	RequireEncryption bool
+
+	// ClosePreviousSession releases everything a session owns — byte-range
+	// locks, descriptors, durable-table entries and outstanding CHANGE_NOTIFY
+	// watches — when a reconnecting client supersedes it via PreviousSessionId.
+	// ServeConn wires this to the dispatcher's releaseOpens; when it is nil the
+	// superseded session is still dropped from the table (its SessionId stops
+	// working) but its handles are left to the connection teardown.
+	ClosePreviousSession func(*Session)
 }
 
 // hasGuestShare reports whether any configured share allows anonymous access.
@@ -427,9 +445,63 @@ func (h *SessionSetupHandler) HandleSessionSetup(rw io.ReadWriter, hdr smb2.Head
 	case ntlm.MessageTypeNegotiate:
 		return h.handleType1(rw, hdr, ntlmMsg, fullRequestFrame)
 	case ntlm.MessageTypeAuthenticate:
-		return h.handleType3(rw, hdr, ntlmMsg, fullRequestFrame)
+		sess, err := h.handleType3(rw, hdr, ntlmMsg, fullRequestFrame)
+		if err == nil && sess != nil {
+			// Only once the client has proved who it is: closing the previous
+			// session is a teardown an unauthenticated peer must never be able
+			// to trigger by naming someone else's SessionId.
+			h.closePreviousSession(req.PreviousSessionID, sess)
+		}
+		return sess, err
 	default:
 		return nil, fmt.Errorf("unexpected NTLM message type 0x%x", msgType)
+	}
+}
+
+// closePreviousSession implements the PreviousSessionId half of MS-SMB2
+// §3.3.5.5.3: a client that reconnects because its own side of the old session
+// broke names that session's id, and the server must close it.
+//
+// Without this the old session's descriptors, byte-range locks and
+// change-notify watches survive until the idle reaper runs — and the stale
+// locks block the very client that just reconnected.
+//
+// Scope, deliberately: SessionTable is per connection (one NewSessionTable per
+// ServeConn), so only a previous session on *this* connection can be found.
+// That is the case where the server still believes the old session is alive on
+// a connection that is provably usable, and it is the reconnect leg a client
+// re-authenticating over a surviving TCP connection sends. A previous session
+// on a different connection cannot be looked up at all without a
+// server-scoped session index, which is a larger change than this defect
+// warrants; see .status.md.
+//
+// The match is on the authenticated user, as the spec requires: naming someone
+// else's SessionId must not close their session.
+func (h *SessionSetupHandler) closePreviousSession(prevID uint64, sess *Session) {
+	if prevID == 0 || sess == nil || h.Sessions == nil || prevID == sess.ID {
+		return
+	}
+	prev := h.Sessions.Get(prevID)
+	if prev == nil {
+		return
+	}
+	if !prev.Authenticated || prev.IsGuest != sess.IsGuest ||
+		!strings.EqualFold(prev.User.Name, sess.User.Name) {
+		if h.Log != nil {
+			h.Log.Warn("ignoring PreviousSessionId naming a session owned by someone else",
+				"previous_session_id", prevID, "session_id", sess.ID)
+		}
+		return
+	}
+	// ClosePreviousSession owns the descriptors, locks and notify watches; the
+	// table entry goes either way so the old SessionId stops being usable.
+	if h.ClosePreviousSession != nil {
+		h.ClosePreviousSession(prev)
+	}
+	h.Sessions.Remove(prevID)
+	if h.Log != nil {
+		h.Log.Info("closed previous session on reconnect",
+			"previous_session_id", prevID, "session_id", sess.ID, "smb_user", sess.User.Name)
 	}
 }
 
@@ -461,11 +533,10 @@ func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, typ
 	})
 
 	// Retain both halves of the handshake so handleType3 can recompute the
-	// NTLMSSP MIC. type1 is what UnwrapNTLM pulled out of the client's SPNEGO
-	// NegTokenInit; there is nothing after the mechToken in that token (a
-	// mechListMIC needs a session key the client does not have yet), so these
-	// are exactly the NEGOTIATE_MESSAGE bytes the client hashed. type2 is
-	// verbatim what we are about to send.
+	// NTLMSSP MIC. type1 is the mechToken UnwrapNTLM pulled out of the client's
+	// SPNEGO NegTokenInit, trimmed to the token itself — so these are exactly
+	// the NEGOTIATE_MESSAGE bytes the client hashed, whatever DER the client
+	// put after the token. type2 is verbatim what we are about to send.
 	sess.ntlmNegotiate = append([]byte(nil), type1...)
 	sess.ntlmChallenge = append([]byte(nil), type2...)
 

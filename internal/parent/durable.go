@@ -546,6 +546,18 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	if !open.IsDir {
 		f, err := os.OpenFile(open.Path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
 		if err != nil {
+			// Falling back to read-only while still reporting the saved
+			// GrantedAccess would hand the client a handle that lies about
+			// itself: it says it may write, the descriptor cannot, and the
+			// first WRITE fails mid-stream. The client does no post-reclaim
+			// validation, so it would never see it coming. Refuse the reclaim
+			// instead — a failed reconnect makes the client re-open the file
+			// fresh, which is a clean error at a point it can handle.
+			if open.GrantedAccess&durableWriteAccess != 0 {
+				d.Log.Warn("durable reconnect refused: file is no longer writable",
+					"path", open.Path, "share", tree.Share.Name, "err", err)
+				return false
+			}
 			f, err = os.OpenFile(open.Path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 			if err != nil {
 				// The file vanished while detached — treat as no longer

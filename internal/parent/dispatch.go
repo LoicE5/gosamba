@@ -746,7 +746,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// Open and re-open its backing file rather than re-running disposition.
 	durReq, durRec, leaseReq := parseDurableContexts(req.CreateContexts)
 	if durRec.present && tree.Share.Path != "" {
-		if d.handleDurableReconnect(rw, hdr, sess, tree, durRec) {
+		if d.handleDurableReconnect(rw, hdr, sess, tree, durRec, leaseReq) {
 			return true
 		}
 		// Reclaim failed/expired → OBJECT_NAME_NOT_FOUND so the client

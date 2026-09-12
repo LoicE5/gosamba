@@ -523,10 +523,18 @@ func durableLookupKey(rec durableReconnect) [16]byte {
 
 // handleDurableReconnect attempts to reclaim a durable open for a DH2C/DHnC
 // reconnect. On success it re-opens the backing file, restores the original
-// FileID into the new session, writes a SUCCESS CREATE response echoing the
-// reconnect context, and returns true. It returns false if no live entry
-// exists (caller then sends OBJECT_NAME_NOT_FOUND).
-func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, sess *Session, tree *Tree, rec durableReconnect) bool {
+// FileID into the new session, writes a SUCCESS CREATE response carrying the
+// response context that the governing spec section prescribes, and returns
+// true. It returns false if no live entry exists (caller then sends
+// OBJECT_NAME_NOT_FOUND).
+//
+// lr is the RqLs create context parsed from the same CREATE. A client that
+// asks to reconnect a durable handle is required to ask for a lease in the
+// same request (Apple's SMBClient builds the two together in
+// smb_smb_2.c: "Requesting a Durable Handle requires that you also request a
+// Lease", and the test covers SMB2_CREATE_DUR_HANDLE_RECONNECT), so for a v2
+// reconnect lr is what the response is built from.
+func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, sess *Session, tree *Tree, rec durableReconnect, lr leaseRequest) bool {
 	if d.Conn == nil || d.Conn.Durable == nil {
 		return false
 	}
@@ -638,14 +646,48 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 		mtime = filetimeFromTime(st.ModTime())
 	}
 
-	// Echo the reconnect context back so the client knows the handle was
-	// reclaimed: DH2C is acknowledged with a DH2Q response context.
+	// Build the response contexts. The two reconnect versions are governed by
+	// different spec sections with different Response Construction phases, so
+	// they do NOT get the same treatment.
+	//
+	// DH2C — MS-SMB2 §3.3.5.9.12 ("Handling the
+	// SMB2_CREATE_DURABLE_HANDLE_RECONNECT_V2 Create Context"). Its Response
+	// Construction phase enumerates exactly two possible contexts, both leases:
+	// SMB2_CREATE_RESPONSE_LEASE_V2 (§2.2.14.2.11) and
+	// SMB2_CREATE_RESPONSE_LEASE (§2.2.14.2.10). It never constructs a durable
+	// handle response, and step 2.14 makes a DH2Q arriving alongside a DH2C an
+	// error — so a DH2Q reply answers a request context the client could not
+	// legally have sent. Apple's SMBClient reaches the same conclusion from the
+	// wire (smb_smb_2.c: "The response to a DH2C seems to be ONLY a RqLs
+	// reply"), and the mistake is not cosmetic there: the client clears
+	// SMB2_DURABLE_HANDLE_RECONNECT only in its RqLs arm, while its DH2Q arm
+	// clears SMB2_DURABLE_HANDLE_REQUEST, which a reconnect never set. Echoing
+	// DH2Q therefore left the client believing the reconnect was still pending
+	// after a reconnect we had in fact granted, and additionally tripped
+	// SMB2_DURABLE_HANDLE_FAIL for the request/response version mismatch.
+	//
+	// DHnC — §3.3.5.9.7 is a different section with its own construction phase,
+	// and Apple observes "a RqLs and DHnQ reply" for it, so v1 keeps its DHnQ
+	// echo unchanged.
 	var echo []smb2.CreateContext
 	if rec.v2 {
-		echo = append(echo, smb2.CreateContext{
-			Name: tagDH2Q,
-			Data: encodeDH2QResponse(uint32(d.Conn.DurableTimeout/time.Millisecond), 0),
-		})
+		if lr.present {
+			// Grant LEASE_NONE, exactly as the fresh-CREATE path does (see
+			// applyDurableAndLease): we implement no lease-break machinery, so
+			// any caching grant would let the client serve stale data. The
+			// lease key is the client's own, from the RqLs it sent with this
+			// reconnect, and the v1/v2 form matches what it asked with.
+			echo = append(echo, smb2.CreateContext{
+				Name: tagRqLs,
+				Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2),
+			})
+		}
+		// No RqLs in the request means no Open.Lease to describe, and
+		// §3.3.5.9.12 gates both of its response contexts on Open.Lease being
+		// non-NULL — so it constructs nothing at all. SUCCESS plus the
+		// reclaimed FileID is then the entire answer, which is what a client
+		// that asked for no lease is waiting for. Inventing a DH2Q here would
+		// reintroduce exactly the context the section refuses to construct.
 	} else {
 		echo = append(echo, smb2.CreateContext{Name: tagDHnQ, Data: encodeDHnQResponse()})
 	}

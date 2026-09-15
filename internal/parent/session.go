@@ -316,6 +316,30 @@ func (s *Session) AddOpen(o *Open) bool {
 	return true
 }
 
+// AddOpenToTree registers a handle only if its tree is still connected.
+//
+// AddOpen's dead latch covers a session torn down under an in-flight CREATE,
+// but TREE_DISCONNECT does not latch anything — RemoveTreeAndOpens sweeps the
+// opens map and a CREATE that has not reached AddOpen yet is not in it. A
+// CREATE can now park for up to sharingViolationWait waiting out a sharing
+// conflict, which makes that window wide enough to matter: the handle would be
+// published onto a tree no request can name again, so no CLOSE and no second
+// TREE_DISCONNECT would ever release its descriptor or its share-mode
+// reservation.
+func (s *Session) AddOpenToTree(o *Open, treeID uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dead {
+		return false
+	}
+	if _, ok := s.trees[treeID]; !ok {
+		return false
+	}
+	s.initTables()
+	s.opens[o.FileID] = o
+	return true
+}
+
 func (s *Session) GetOpen(id [16]byte) *Open {
 	s.mu.Lock()
 	defer s.mu.Unlock()

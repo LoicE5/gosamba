@@ -260,3 +260,85 @@ func TestFixShareWait_ParkedCreatesAreCapped(t *testing.T) {
 	}
 	waitClose(t, dr, sr, tr, readerFID)
 }
+
+// TestFixShareWait_TreeDisconnectStopsParkedCreatePublishing is the
+// regression for the second finding: a CREATE that parks on a sharing
+// conflict and then wins its acquire, after its tree was disconnected while
+// it waited, must not publish its handle. RemoveTreeAndOpens cannot sweep a
+// handle that has not reached AddOpen yet, so the CREATE's own publish step
+// has to notice the tree is gone; without that check the handle lands in
+// sess.opens hanging off a tree nobody can reach, and neither a CLOSE nor a
+// second TREE_DISCONNECT ever frees its descriptor or its share-mode
+// reservation.
+func TestFixShareWait_TreeDisconnectStopsParkedCreatePublishing(t *testing.T) {
+	dir := t.TempDir()
+	baseline := sharedShareModes.len()
+	t.Cleanup(func() {
+		if got := sharedShareModes.len(); got != baseline {
+			t.Errorf("share-mode table holds %d reservations at test end, want %d", got, baseline)
+		}
+	})
+
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Holder is one connection; the parking CREATE is on another, whose tree
+	// we disconnect while it waits.
+	dh, sh, th := newWaitDispatcher(t, dir)
+	dd, sd, td := newWaitDispatcher(t, dir)
+
+	st, holderFID := waitCreate(t, dh, sh, th, "f.txt",
+		accDelete|smb2.AccessFileReadAttributes|accSynchronize, shareNone)
+	if st != smb2.StatusSuccess {
+		t.Fatalf("holder CREATE = %#x, want success", uint32(st))
+	}
+
+	// Dispatch the conflicting CREATE off the test goroutine: it parks on the
+	// holder's deny-all reservation until the holder's CLOSE releases it.
+	// Decode without any t.Fatalf-bearing helper, since this runs off the
+	// test goroutine, and report the status back over a channel.
+	statusCh := make(chan smb2.Status, 1)
+	go func() {
+		var buf bytes.Buffer
+		fd := dd.forFrame(false)
+		fd.handleCreate(&buf, smb2.Header{Command: smb2.CommandCreate, TreeID: td.ID},
+			buildCreateBodyShare("f.txt", smb2.CreateDispositionOpen, 0,
+				accDelete|smb2.AccessFileReadAttributes|accSynchronize, shareNone, nil), sd)
+		fd.flush(&buf)
+		status := smb2.Status(0xFFFFFFFF)
+		if frame := buf.Bytes(); len(frame) >= 4+smb2.HeaderSize {
+			if hdr, err := smb2.DecodeHeader(frame[4 : 4+smb2.HeaderSize]); err == nil {
+				status = smb2.Status(hdr.Status)
+			}
+		}
+		statusCh <- status
+	}()
+
+	// Wait until the CREATE has actually parked before disconnecting its
+	// tree, or the disconnect could land before there is anything to race.
+	// Bounded so a regression that stops it parking fails here with a
+	// readable message rather than hanging.
+	parkDeadline := time.Now().Add(5 * time.Second)
+	for dd.Conn.sharingWaits.Load() < 1 {
+		if time.Now().After(parkDeadline) {
+			t.Fatalf("CREATE never parked on the sharing conflict")
+		}
+		runtime.Gosched()
+	}
+
+	// Disconnect the tree the parked CREATE belongs to, exactly as a second
+	// frame on the same connection racing the CREATE would.
+	sd.RemoveTreeAndOpens(td.ID)
+
+	// Let the holder go, so the parked CREATE wins its acquire.
+	waitClose(t, dh, sh, th, holderFID)
+
+	status := <-statusCh
+	if status != smb2.StatusUserSessionDeleted {
+		t.Fatalf("parked CREATE that outlived its tree = %#x, want STATUS_USER_SESSION_DELETED", uint32(status))
+	}
+	if got := sd.OpenCount(); got != 0 {
+		t.Errorf("session holds %d opens after a parked CREATE lost its tree, want 0", got)
+	}
+}

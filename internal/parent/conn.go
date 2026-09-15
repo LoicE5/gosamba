@@ -96,6 +96,9 @@ type ConnOptions struct {
 // fed anyway. The floor is set above the eight concurrent transfers the macOS
 // client pipelines, so a small machine still serves that pipeline in parallel.
 const (
+	// minConnWorkers must stay above maxSharingWaits (sharewait.go) with room
+	// to spare, or a connection could park every worker on a contended file
+	// and have none left to run the CLOSE that would free it.
 	minConnWorkers = 8
 	maxConnWorkers = 64
 )

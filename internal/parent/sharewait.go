@@ -32,12 +32,10 @@ const (
 	// case returns almost immediately; this is only the ceiling for a holder
 	// that never lets go. It is far inside any client's request timeout.
 	//
-	// The ceiling is per wait, not per CREATE: a truncating-disposition CREATE
-	// (FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE) makes two sequential
-	// waits — the pre-open check in checkShareMode (dispatch.go) and, if that
-	// passes, the reservation in acquireShareMode (dispatch.go) — so it can
-	// take up to twice this in the worst case. The two waits are sequential,
-	// not nested, so the per-connection parking cap is unaffected.
+	// A CREATE parks at most once: the pre-open check for a truncating
+	// disposition (checkLocked, run via sharedShareModes.check in
+	// dispatch.go) does not wait at all — see the comment at its call site —
+	// so acquireShareMode below is the only wait on the path.
 	sharingViolationWait = 250 * time.Millisecond
 
 	// maxSharingWaits bounds how many CREATEs one connection may park at once.
@@ -47,6 +45,12 @@ const (
 	// answer is the immediate refusal it has always been.
 	maxSharingWaits = 4
 )
+
+// A parked CREATE holds one of the connection's worker-pool slots, so the cap
+// must leave slots free for the CLOSE that would release the conflict — or a
+// connection could park its whole pool on a file only it can free. This fails
+// to compile if minConnWorkers ever drops to maxSharingWaits or below.
+const _ = uint(minConnWorkers - maxSharingWaits - 1)
 
 // beginSharingWait claims one of this connection's parking slots, reporting
 // false when they are all taken (or when there is no Connection at all, which
@@ -119,13 +123,5 @@ func (d *Dispatcher) waitForShareMode(try func() (bool, *shareWaiter)) bool {
 func (d *Dispatcher) acquireShareMode(key fileKey, open *Open, desired, share uint32) bool {
 	return d.waitForShareMode(func() (bool, *shareWaiter) {
 		return sharedShareModes.acquireOrWait(key, open, desired, share)
-	})
-}
-
-// checkShareMode is the read-only form, for the pre-open check a truncating
-// CREATE makes before it has a descriptor.
-func (d *Dispatcher) checkShareMode(key fileKey, desired, share uint32) bool {
-	return d.waitForShareMode(func() (bool, *shareWaiter) {
-		return sharedShareModes.checkOrWait(key, desired, share)
 	})
 }

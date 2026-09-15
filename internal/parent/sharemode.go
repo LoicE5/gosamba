@@ -254,7 +254,9 @@ func entryLive(e shareModeEntry, key fileKey) bool {
 // check runs the sharing-access test for a hypothetical open of key without
 // reserving anything. handleCreate uses it before a disposition that would
 // truncate or replace the file, so a refused open cannot destroy data on its
-// way to being refused. The authoritative test is acquire.
+// way to being refused. It deliberately does not wait out a transient
+// conflict — see the call site in dispatch.go. The authoritative test is
+// acquireLocked, reached through acquireShareMode.
 func (t *shareModeTable) check(key fileKey, desired, share uint32) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -275,19 +277,14 @@ func (t *shareModeTable) checkLocked(key fileKey, desired, share uint32) bool {
 	return true
 }
 
-// acquire runs the sharing-access test against every live open of key and, if
-// it passes, records o's reservation. It returns false when the open must be
-// refused with STATUS_SHARING_VIOLATION; nothing is recorded in that case.
+// acquireLocked runs the sharing-access test against every live open of key
+// and, if it passes, records o's reservation. It returns false when the open
+// must be refused; the caller (acquireOrWait, via acquireShareMode) is what
+// turns that into STATUS_SHARING_VIOLATION or a parked wait. Nothing is
+// recorded when it returns false.
 //
 // Test and insert happen under one lock so two clients racing on the same file
-// cannot both be admitted.
-func (t *shareModeTable) acquire(key fileKey, o *Open, desired, share uint32) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.acquireLocked(key, o, desired, share)
-}
-
-// acquireLocked is acquire's body. The caller holds t.mu.
+// cannot both be admitted. The caller holds t.mu.
 func (t *shareModeTable) acquireLocked(key fileKey, o *Open, desired, share uint32) bool {
 	incoming := newShareModeEntry(o, desired, share)
 	if _, dup := t.owners[o]; dup {
@@ -396,17 +393,6 @@ func (t *shareModeTable) acquireOrWait(key fileKey, o *Open, desired, share uint
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.acquireLocked(key, o, desired, share) {
-		return true, nil
-	}
-	return false, t.registerWaiterLocked(key)
-}
-
-// checkOrWait is acquireOrWait's read-only twin, for the pre-open check a
-// truncating CREATE makes before it has a descriptor to acquire with.
-func (t *shareModeTable) checkOrWait(key fileKey, desired, share uint32) (bool, *shareWaiter) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.checkLocked(key, desired, share) {
 		return true, nil
 	}
 	return false, t.registerWaiterLocked(key)

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -100,18 +101,40 @@ func TestFixShareWait_TransientConflictIsAbsorbed(t *testing.T) {
 		t.Fatalf("reader CREATE = %#x, want success", uint32(st))
 	}
 
-	// The reader lets go 30ms from now — well inside sharingViolationWait.
+	// The reader lets go 30ms from now — well inside sharingViolationWait. The
+	// 30ms sleep is a genuine simulated external event (the other client
+	// letting go), not a synchronisation stand-in, so it stays. Dispatch
+	// through forFrame like the waitCreate/waitClose helpers do, and signal
+	// completion on a channel the test drains before returning, so a reader
+	// release can never land inside a later test's baseline.
+	closeStatusCh := make(chan smb2.Status, 1)
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		var buf bytes.Buffer
-		dr.handleClose(&buf, smb2.Header{Command: smb2.CommandClose, TreeID: tr.ID},
+		fd := dr.forFrame(false)
+		fd.handleClose(&buf, smb2.Header{Command: smb2.CommandClose, TreeID: tr.ID},
 			buildCloseBody(readerFID), sr)
+		fd.flush(&buf)
+		// Decode without calling any t.Fatalf-bearing helper: this runs off
+		// the test goroutine, and the status is asserted after draining below.
+		closeStatus := smb2.Status(0xFFFFFFFF)
+		if frame := buf.Bytes(); len(frame) >= 4+smb2.HeaderSize {
+			if hdr, err := smb2.DecodeHeader(frame[4 : 4+smb2.HeaderSize]); err == nil {
+				closeStatus = smb2.Status(hdr.Status)
+			}
+		}
+		closeStatusCh <- closeStatus
 	}()
 
 	start := time.Now()
 	st, delFID := waitCreate(t, dd, sd, td, "f.txt",
 		accDelete|smb2.AccessFileReadAttributes|accSynchronize, shareNone)
 	elapsed := time.Since(start)
+
+	closeStatus := <-closeStatusCh
+	if closeStatus != smb2.StatusSuccess {
+		t.Errorf("reader CLOSE = %#x, want success", uint32(closeStatus))
+	}
 
 	if st != smb2.StatusSuccess {
 		t.Fatalf("deny-all delete open = %#x, want success after the reader closed", uint32(st))
@@ -128,6 +151,11 @@ func TestFixShareWait_TransientConflictIsAbsorbed(t *testing.T) {
 func TestFixShareWait_HeldConflictStillRefuses(t *testing.T) {
 	dir := t.TempDir()
 	baseline := sharedShareModes.len()
+	t.Cleanup(func() {
+		if got := sharedShareModes.len(); got != baseline {
+			t.Errorf("share-mode table holds %d reservations at test end, want %d", got, baseline)
+		}
+	})
 
 	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -154,10 +182,6 @@ func TestFixShareWait_HeldConflictStillRefuses(t *testing.T) {
 	}
 
 	waitClose(t, dr, sr, tr, readerFID)
-	if got := sharedShareModes.len(); got != baseline {
-		t.Errorf("share-mode table holds %d reservations, want %d: the refused CREATE left something behind",
-			got, baseline)
-	}
 }
 
 // TestFixShareWait_ParkedCreatesAreCapped proves one connection cannot park
@@ -166,6 +190,11 @@ func TestFixShareWait_HeldConflictStillRefuses(t *testing.T) {
 func TestFixShareWait_ParkedCreatesAreCapped(t *testing.T) {
 	dir := t.TempDir()
 	baseline := sharedShareModes.len()
+	t.Cleanup(func() {
+		if got := sharedShareModes.len(); got != baseline {
+			t.Errorf("share-mode table holds %d reservations at test end, want %d", got, baseline)
+		}
+	})
 
 	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -180,17 +209,30 @@ func TestFixShareWait_ParkedCreatesAreCapped(t *testing.T) {
 	}
 
 	// Fill the connection's parking slots with goroutines that will each sit
-	// out the full wait.
+	// out the full wait. These discard their response and exist only to
+	// occupy parking slots, so they dispatch through forFrame directly rather
+	// than through waitCreate: waitCreate reaches readCreateResponse, which
+	// calls t.Fatalf, and t.Fatalf off the test goroutine does not stop the
+	// test.
 	done := make(chan struct{}, maxSharingWaits)
 	for i := 0; i < maxSharingWaits; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			waitCreate(t, dd, sd, td, "f.txt",
-				accDelete|smb2.AccessFileReadAttributes|accSynchronize, shareNone)
+			var buf bytes.Buffer
+			fd := dd.forFrame(false)
+			fd.handleCreate(&buf, smb2.Header{Command: smb2.CommandCreate, TreeID: td.ID},
+				buildCreateBodyShare("f.txt", smb2.CreateDispositionOpen, 0,
+					accDelete|smb2.AccessFileReadAttributes|accSynchronize, shareNone, nil), sd)
+			fd.flush(&buf)
 		}()
 	}
-	// Give them time to park.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until all four are actually parked. Sleeping here instead would
+	// race: on a loaded machine a goroutine that has not yet reached
+	// beginSharingWait leaves a slot free, and the CREATE below would park
+	// rather than testing the cap.
+	for dd.Conn.sharingWaits.Load() < maxSharingWaits {
+		runtime.Gosched()
+	}
 
 	start := time.Now()
 	st, _ = waitCreate(t, dd, sd, td, "f.txt",
@@ -208,7 +250,4 @@ func TestFixShareWait_ParkedCreatesAreCapped(t *testing.T) {
 		<-done
 	}
 	waitClose(t, dr, sr, tr, readerFID)
-	if got := sharedShareModes.len(); got != baseline {
-		t.Errorf("share-mode table holds %d reservations, want %d", got, baseline)
-	}
 }

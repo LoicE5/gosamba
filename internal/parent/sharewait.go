@@ -26,11 +26,18 @@ import "time"
 // first.
 
 const (
-	// sharingViolationWait bounds how long a refused CREATE is parked before
-	// the client is told. Measured overlaps between two macOS clients are
+	// sharingViolationWait bounds how long a single wait parks before the
+	// caller is told. Measured overlaps between two macOS clients are
 	// single-digit milliseconds, and the wait is edge-triggered, so the common
 	// case returns almost immediately; this is only the ceiling for a holder
 	// that never lets go. It is far inside any client's request timeout.
+	//
+	// The ceiling is per wait, not per CREATE: a truncating-disposition CREATE
+	// (FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE) makes two sequential
+	// waits — the pre-open check in checkShareMode (dispatch.go) and, if that
+	// passes, the reservation in acquireShareMode (dispatch.go) — so it can
+	// take up to twice this in the worst case. The two waits are sequential,
+	// not nested, so the per-connection parking cap is unaffected.
 	sharingViolationWait = 250 * time.Millisecond
 
 	// maxSharingWaits bounds how many CREATEs one connection may park at once.
@@ -84,6 +91,17 @@ func (d *Dispatcher) waitForShareMode(try func() (bool, *shareWaiter)) bool {
 	deadline := time.NewTimer(sharingViolationWait)
 	defer deadline.Stop()
 	for {
+		// select picks randomly among ready cases, and once deadline.C has
+		// fired it stays ready alongside w.ch. Without this non-blocking
+		// probe, a file whose reservation changes hands every few
+		// milliseconds could keep winning the random pick on w.ch and
+		// extend the wait past the ceiling by a geometric number of cycles.
+		select {
+		case <-deadline.C:
+			sharedShareModes.unwait(w)
+			return false
+		default:
+		}
 		select {
 		case <-w.ch:
 			// Woken: the registration is already gone from the table.

@@ -451,12 +451,34 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 	// this op is referencing that handle, inherit the prior status (per
 	// MS-SMB2 §3.3.5.2.7) — otherwise we'd send INVALID_PARAMETER and
 	// confuse clients (Finder reads it as a permission fault).
+	//
+	// The one op that must never be swallowed that way is a CLOSE naming a
+	// handle this chain actually opened. macOS sends CREATE/SomeOp/CLOSE as one
+	// related chain for almost everything it does, so a failure in the middle
+	// used to leave the handle in the session's map with its descriptor, its
+	// byte-range locks and its share-mode reservation held until the connection
+	// died. In the delete chain (CREATE / SET_INFO FileDispositionInformation /
+	// CLOSE) macOS opens deny-all, so that stranded reservation made the file
+	// unopenable by every client on every connection.
+	//
+	// ksmbd draws the line in the same place: it stores the chain's FID only
+	// when the CREATE succeeded, resolves a sentinel CLOSE against it and
+	// executes the close whatever an earlier member did, then clears the FID so
+	// a later sentinel op in the same chain finds nothing
+	// (fs/smb/server/smb2pdu.c, smb2_close).
 	if hdr.Flags&smb2.FlagRelatedOps != 0 {
-		if d.lastChainStatus != smb2.StatusSuccess && hasPreviousHandleSentinel(hdr.Command, body) {
+		sentinel := hasPreviousHandleSentinel(hdr.Command, body)
+		closesLiveHandle := sentinel && d.HasLastCreated && hdr.Command == smb2.CommandClose
+		if sentinel && d.lastChainStatus != smb2.StatusSuccess && !closesLiveHandle {
 			d.respondError(rw, hdr, d.lastChainStatus, sess)
 			return true
 		}
 		d.SubstitutePreviousHandleFileID(hdr.Command, body)
+		if closesLiveHandle {
+			// The handle is consumed; a second sentinel op in this chain names
+			// nothing and falls back to the inherited-status arm above.
+			d.HasLastCreated = false
+		}
 	}
 
 	// Frames run concurrently, so two messages can now reach the same handle at

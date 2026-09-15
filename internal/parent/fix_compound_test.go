@@ -465,6 +465,145 @@ func TestCompound_SingleResponseIsUnpadded(t *testing.T) {
 // TestCompound_CancelProducesNoFrame proves a chain that answers nothing — an
 // SMB2_CANCEL is completed by finishing the request it names, never with a
 // response of its own — flushes nothing rather than an empty frame.
+// --- a related CLOSE was short-circuited and its handle stranded ---
+//
+// macOS sends CREATE/SomeOp/CLOSE as one related chain (SMBClient
+// kernel/netsmb/smb_iod.c: "The typical compound request would be
+// Create/SomeOp/Close"). Dispatch refused any related op carrying the all-FF
+// previous-handle sentinel once an earlier member had failed, which swallowed
+// the CLOSE as well — leaving the descriptor, its byte-range locks and its
+// share-mode reservation in place for the life of the connection. ksmbd
+// resolves a sentinel CLOSE against the chain's stored FID and runs it whatever
+// an earlier member did (fs/smb/server/smb2pdu.c, smb2_close).
+
+// encodeChainMsg frames one member of a compound chain: a 64-byte SMB2 header
+// carrying next as its NextCommand, followed by body.
+func encodeChainMsg(t *testing.T, hdr smb2.Header, body []byte, next uint32) []byte {
+	t.Helper()
+	hdr.NextCommand = next
+	h := make([]byte, smb2.HeaderSize)
+	if err := smb2.EncodeHeader(h, hdr); err != nil {
+		t.Fatalf("EncodeHeader: %v", err)
+	}
+	return append(h, body...)
+}
+
+// runRawChain walks a compound frame the way ServeConn's serveFrame does: one
+// per-frame Dispatcher clone, then Dispatch per member over its own slice.
+//
+// This differs from runChain above in that it drives Dispatch from the raw,
+// already-framed wire bytes (decoding each member's header off the frame)
+// rather than from hdr/body struct pairs, so it exercises the same header
+// decode path a real connection uses.
+func runRawChain(t *testing.T, d *Dispatcher, frame []byte) {
+	t.Helper()
+	fd := d.forFrame(false)
+	var sink bytes.Buffer
+	defer fd.flush(&sink)
+	for off := 0; off < len(frame); {
+		hdr, err := smb2.DecodeHeader(frame[off : off+smb2.HeaderSize])
+		if err != nil {
+			t.Fatalf("DecodeHeader at %d: %v", off, err)
+		}
+		end := len(frame)
+		if hdr.NextCommand != 0 {
+			end = off + int(hdr.NextCommand)
+		}
+		msg := frame[off:end]
+		if !fd.Dispatch(&sink, hdr, msg[smb2.HeaderSize:], msg) {
+			return
+		}
+		if hdr.NextCommand == 0 {
+			return
+		}
+		off = end
+	}
+}
+
+// renameInfoBuf builds a FileRenameInformation SET_INFO buffer.
+func renameInfoBuf(newName string, replace bool) []byte {
+	nameU16 := utf16leName(newName)
+	buf := make([]byte, 20+len(nameU16))
+	if replace {
+		buf[0] = 1
+	}
+	binary.LittleEndian.PutUint32(buf[16:], uint32(len(nameU16)))
+	copy(buf[20:], nameU16)
+	return buf
+}
+
+// newRelatedChainDispatcher builds a Dispatcher that Dispatch can drive: it
+// needs a SessionTable to resolve the SessionId, an authenticated session, a
+// Connection, and the shared byte-range lock manager.
+//
+// This is deliberately a separate fixture from newChainDispatcher above (which
+// this test cannot reuse without a name collision): it sets SessionID directly
+// on each encoded header rather than having a shared runner stamp it in, since
+// runRawChain drives Dispatch from raw wire bytes it decodes itself.
+func newRelatedChainDispatcher(t *testing.T, shareDir string) (*Dispatcher, *Session, *Tree) {
+	t.Helper()
+	share := config.ShareConfig{Name: "share", Path: shareDir}
+	conn := &Connection{MaxIOSize: 1 << 20}
+	conn.ClientGuid[0] = 0xC7
+	d := &Dispatcher{
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Shares:   []config.ShareConfig{share},
+		Conn:     conn,
+		Sessions: NewSessionTable(),
+		locks:    sharedLockManager,
+		async:    &asyncTable{},
+	}
+	sess := d.Sessions.New()
+	sess.Authenticated = true
+	tree := sess.AddTree(share)
+	return d, sess, tree
+}
+
+func TestFixCompound_FailedMiddleOpStillClosesTheHandle(t *testing.T) {
+	dir := t.TempDir()
+	baseline := sharedShareModes.len()
+	d, sess, tree := newRelatedChainDispatcher(t, dir)
+
+	for _, n := range []string{"index.lock", "index"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// CREATE index.lock — succeeds.
+	cb := buildCreateBodyShare("index.lock", smb2.CreateDispositionOpen, 0,
+		smb2.AccessFileReadData|smb2.AccessFileWriteData|accDelete,
+		shareAccessRead|shareAccessDelete, nil)
+	createMsg := encodeChainMsg(t, smb2.Header{
+		Command: smb2.CommandCreate, TreeID: tree.ID, SessionID: sess.ID, MessageID: 1,
+	}, cb, uint32(smb2.HeaderSize+len(cb)))
+
+	// SET_INFO rename onto an existing name without ReplaceIfExists — fails
+	// with STATUS_OBJECT_NAME_COLLISION.
+	sb := buildSetInfoBody(byte(smb2.InfoTypeFile), byte(smb2.FileRenameInformation),
+		previousHandleFileID, renameInfoBuf("index", false))
+	setMsg := encodeChainMsg(t, smb2.Header{
+		Command: smb2.CommandSetInfo, TreeID: tree.ID, SessionID: sess.ID, MessageID: 2,
+		Flags: smb2.FlagRelatedOps,
+	}, sb, uint32(smb2.HeaderSize+len(sb)))
+
+	// CLOSE on the sentinel — must run anyway.
+	closeMsg := encodeChainMsg(t, smb2.Header{
+		Command: smb2.CommandClose, TreeID: tree.ID, SessionID: sess.ID, MessageID: 3,
+		Flags: smb2.FlagRelatedOps,
+	}, buildCloseBody(previousHandleFileID), 0)
+
+	runRawChain(t, d, append(append(createMsg, setMsg...), closeMsg...))
+
+	if n := sess.OpenCount(); n != 0 {
+		t.Errorf("session still holds %d open(s) after the chain's CLOSE, want 0", n)
+	}
+	if got := sharedShareModes.len(); got != baseline {
+		t.Errorf("share-mode table holds %d reservations, want %d: the handle leaked its entry",
+			got, baseline)
+	}
+}
+
 func TestCompound_CancelProducesNoFrame(t *testing.T) {
 	dir := t.TempDir()
 	d, sess, _ := newChainDispatcher(t, dir)

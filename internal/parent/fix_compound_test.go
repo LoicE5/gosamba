@@ -465,6 +465,23 @@ func TestCompound_SingleResponseIsUnpadded(t *testing.T) {
 // TestCompound_CancelProducesNoFrame proves a chain that answers nothing — an
 // SMB2_CANCEL is completed by finishing the request it names, never with a
 // response of its own — flushes nothing rather than an empty frame.
+func TestCompound_CancelProducesNoFrame(t *testing.T) {
+	dir := t.TempDir()
+	d, sess, _ := newChainDispatcher(t, dir)
+
+	fd := d.forFrame(false)
+	var buf bytes.Buffer
+	cancelBody := make([]byte, 4)
+	binary.LittleEndian.PutUint16(cancelBody, 4)
+	if !fd.Dispatch(&buf, smb2.Header{Command: smb2.CommandCancel, SessionID: sess.ID, MessageID: 99}, cancelBody, nil) {
+		t.Fatal("CANCEL dropped the connection")
+	}
+	fd.flush(&buf)
+	if buf.Len() != 0 {
+		t.Errorf("CANCEL produced %d bytes of response, want none", buf.Len())
+	}
+}
+
 // --- a related CLOSE was short-circuited and its handle stranded ---
 //
 // macOS sends CREATE/SomeOp/CLOSE as one related chain (SMBClient
@@ -601,22 +618,5 @@ func TestFixCompound_FailedMiddleOpStillClosesTheHandle(t *testing.T) {
 	if got := sharedShareModes.len(); got != baseline {
 		t.Errorf("share-mode table holds %d reservations, want %d: the handle leaked its entry",
 			got, baseline)
-	}
-}
-
-func TestCompound_CancelProducesNoFrame(t *testing.T) {
-	dir := t.TempDir()
-	d, sess, _ := newChainDispatcher(t, dir)
-
-	fd := d.forFrame(false)
-	var buf bytes.Buffer
-	cancelBody := make([]byte, 4)
-	binary.LittleEndian.PutUint16(cancelBody, 4)
-	if !fd.Dispatch(&buf, smb2.Header{Command: smb2.CommandCancel, SessionID: sess.ID, MessageID: 99}, cancelBody, nil) {
-		t.Fatal("CANCEL dropped the connection")
-	}
-	fd.flush(&buf)
-	if buf.Len() != 0 {
-		t.Errorf("CANCEL produced %d bytes of response, want none", buf.Len())
 	}
 }

@@ -230,7 +230,16 @@ func TestFixShareWait_ParkedCreatesAreCapped(t *testing.T) {
 	// race: on a loaded machine a goroutine that has not yet reached
 	// beginSharingWait leaves a slot free, and the CREATE below would park
 	// rather than testing the cap.
+	//
+	// Bounded so that a regression which stops one of them parking fails here
+	// with a readable message, rather than spinning until the go test timeout
+	// kills the run and leaves a goroutine dump to interpret.
+	parkDeadline := time.Now().Add(5 * time.Second)
 	for dd.Conn.sharingWaits.Load() < maxSharingWaits {
+		if time.Now().After(parkDeadline) {
+			t.Fatalf("only %d of %d CREATEs parked on the sharing conflict",
+				dd.Conn.sharingWaits.Load(), maxSharingWaits)
+		}
 		runtime.Gosched()
 	}
 

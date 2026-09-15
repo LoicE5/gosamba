@@ -1193,7 +1193,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// nothing to protect, since they do not touch the file before the acquire.
 	if truncatingDisposition(req.CreateDisposition) && exists && !isDir {
 		if key, ok := shareKeyForPath(osPath); ok &&
-			!sharedShareModes.check(key, req.DesiredAccess, req.ShareAccess) {
+			!d.checkShareMode(key, req.DesiredAccess, req.ShareAccess) {
 			d.respondError(rw, hdr, smb2.StatusSharingViolation, sess)
 			return true
 		}
@@ -1398,7 +1398,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// leave the reservation behind.
 	if shareModeApplies(open) {
 		key, keyOK := shareKeyForFd(int(open.File.Fd()))
-		if keyOK && !sharedShareModes.acquire(key, open, req.DesiredAccess, req.ShareAccess) {
+		if keyOK && !d.acquireShareMode(key, open, req.DesiredAccess, req.ShareAccess) {
 			// Refused: hand back the descriptor before answering, or the fd
 			// leaks for the life of the process.
 			open.File.Close()

@@ -141,6 +141,19 @@ func shareConflict(existing, incoming shareModeEntry) bool {
 	return false
 }
 
+// shareWaiter is one CREATE parked on another handle's deny mode, waiting for
+// the wake that releasing it sends.
+//
+// The wait is edge-triggered rather than polled on purpose: retrying by
+// re-running the CREATE would re-resolve the path and re-open the descriptor —
+// roughly a dozen metadata syscalls an attempt — for a condition that lives
+// entirely in this table. A waiter sleeps until a release on its key actually
+// happens, and retries only the in-memory test.
+type shareWaiter struct {
+	key fileKey
+	ch  chan struct{}
+}
+
 // shareModeTable is the process-global set of live share reservations.
 //
 // byFile is the conflict index; owners is the reverse index that makes release
@@ -151,12 +164,16 @@ type shareModeTable struct {
 	mu     sync.Mutex
 	byFile map[fileKey][]shareModeEntry
 	owners map[*Open]fileKey
+	// waiters are the CREATEs parked on each file, woken when a reservation on
+	// that file is given up. Empty in the overwhelmingly common case.
+	waiters map[fileKey][]*shareWaiter
 }
 
 func newShareModeTable() *shareModeTable {
 	return &shareModeTable{
-		byFile: make(map[fileKey][]shareModeEntry),
-		owners: make(map[*Open]fileKey),
+		byFile:  make(map[fileKey][]shareModeEntry),
+		owners:  make(map[*Open]fileKey),
+		waiters: make(map[fileKey][]*shareWaiter),
 	}
 }
 
@@ -239,9 +256,14 @@ func entryLive(e shareModeEntry, key fileKey) bool {
 // truncate or replace the file, so a refused open cannot destroy data on its
 // way to being refused. The authoritative test is acquire.
 func (t *shareModeTable) check(key fileKey, desired, share uint32) bool {
-	probe := newShareModeEntry(nil, desired, share)
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.checkLocked(key, desired, share)
+}
+
+// checkLocked is check's body. The caller holds t.mu.
+func (t *shareModeTable) checkLocked(key fileKey, desired, share uint32) bool {
+	probe := newShareModeEntry(nil, desired, share)
 	for _, e := range t.byFile[key] {
 		if !entryLive(e, key) {
 			continue
@@ -260,9 +282,14 @@ func (t *shareModeTable) check(key fileKey, desired, share uint32) bool {
 // Test and insert happen under one lock so two clients racing on the same file
 // cannot both be admitted.
 func (t *shareModeTable) acquire(key fileKey, o *Open, desired, share uint32) bool {
-	incoming := newShareModeEntry(o, desired, share)
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.acquireLocked(key, o, desired, share)
+}
+
+// acquireLocked is acquire's body. The caller holds t.mu.
+func (t *shareModeTable) acquireLocked(key fileKey, o *Open, desired, share uint32) bool {
+	incoming := newShareModeEntry(o, desired, share)
 	if _, dup := t.owners[o]; dup {
 		// Already holds a reservation; never let one handle occupy two slots.
 		return true
@@ -309,6 +336,9 @@ func (t *shareModeTable) release(o *Open) {
 		kept = append(kept, e)
 	}
 	t.store(key, kept)
+	// This file just gave up a reservation, so a CREATE parked on it may now
+	// get in. Waking under the lock is safe: wakeLocked only closes channels.
+	t.wakeLocked(key)
 }
 
 // transfer moves a reservation from one *Open to another without ever giving up
@@ -356,4 +386,70 @@ func (t *shareModeTable) len() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.owners)
+}
+
+// acquireOrWait is acquireLocked plus, on refusal, a registration for the wake
+// that releasing the conflicting reservation will send. Test and registration
+// happen under one lock so a release landing between the two cannot be missed —
+// which is the whole reason this is not "acquire, then subscribe".
+func (t *shareModeTable) acquireOrWait(key fileKey, o *Open, desired, share uint32) (bool, *shareWaiter) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.acquireLocked(key, o, desired, share) {
+		return true, nil
+	}
+	return false, t.registerWaiterLocked(key)
+}
+
+// checkOrWait is acquireOrWait's read-only twin, for the pre-open check a
+// truncating CREATE makes before it has a descriptor to acquire with.
+func (t *shareModeTable) checkOrWait(key fileKey, desired, share uint32) (bool, *shareWaiter) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.checkLocked(key, desired, share) {
+		return true, nil
+	}
+	return false, t.registerWaiterLocked(key)
+}
+
+func (t *shareModeTable) registerWaiterLocked(key fileKey) *shareWaiter {
+	w := &shareWaiter{key: key, ch: make(chan struct{})}
+	t.waiters[key] = append(t.waiters[key], w)
+	return w
+}
+
+// unwait drops a registration a waiter is giving up on. It must be called on
+// every path that stops waiting without being woken, or the table accumulates
+// a channel per abandoned CREATE.
+func (t *shareModeTable) unwait(w *shareWaiter) {
+	if w == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ws := t.waiters[w.key]
+	for i, x := range ws {
+		if x == w {
+			ws = append(ws[:i], ws[i+1:]...)
+			if len(ws) == 0 {
+				delete(t.waiters, w.key)
+			} else {
+				t.waiters[w.key] = ws
+			}
+			return
+		}
+	}
+}
+
+// wakeLocked wakes everyone parked on key and clears the list. A woken waiter
+// is no longer registered, so it re-registers if it has to wait again.
+func (t *shareModeTable) wakeLocked(key fileKey) {
+	ws := t.waiters[key]
+	if len(ws) == 0 {
+		return
+	}
+	delete(t.waiters, key)
+	for _, w := range ws {
+		close(w.ch)
+	}
 }

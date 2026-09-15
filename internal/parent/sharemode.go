@@ -60,6 +60,22 @@ const (
 	sharingDeleteAccess = accDelete | smb2.AccessGenericAll
 )
 
+// sharingAttrOnlyAccess is the set of DesiredAccess bits that, on their own,
+// make an open "attribute only": it reads or writes metadata and never touches
+// the file's data or its name.
+//
+// Two opens that disagree on this are exempt from the sharing check entirely,
+// in both directions — an attribute open neither trips another handle's deny
+// mode nor imposes its own. macOS issues these constantly (DesiredAccess
+// 0x00100080 = SYNCHRONIZE|FILE_READ_ATTRIBUTES is all over a normal trace)
+// and smbfs_get_rights_shareMode can hand them a deny-all ShareAccess, so
+// honouring that deny mode refuses ordinary data opens on behalf of a handle
+// that is not reading or writing anything. ksmbd draws the same exemption:
+// fp->attrib_only in fs/smb/server/smb2pdu.c and the
+// "prev_fp->attrib_only != curr_fp->attrib_only" skip in
+// fs/smb/server/smb_common.c.
+const sharingAttrOnlyAccess = accFileReadAttributes | accFileWriteAttributes | accSynchronize
+
 // shareModeEntry is one live open's contribution to a file's share state: what
 // it asked to do, and what it will let others do.
 //
@@ -71,20 +87,24 @@ const (
 // open. On Windows the granted mask equals the requested one, so checking the
 // request is the faithful reading of §3.3.5.9 for this server.
 type shareModeEntry struct {
-	owner  *Open
-	read   bool
-	write  bool
-	del    bool
-	shared uint32 // the open's ShareAccess mask
+	owner *Open
+	read  bool
+	write bool
+	del   bool
+	// attrOnly marks an open whose DesiredAccess is entirely within
+	// sharingAttrOnlyAccess. See that constant for why it is exempt.
+	attrOnly bool
+	shared   uint32 // the open's ShareAccess mask
 }
 
 func newShareModeEntry(owner *Open, desired, share uint32) shareModeEntry {
 	return shareModeEntry{
-		owner:  owner,
-		read:   desired&sharingReadAccess != 0,
-		write:  desired&sharingWriteAccess != 0,
-		del:    desired&sharingDeleteAccess != 0,
-		shared: share,
+		owner:    owner,
+		read:     desired&sharingReadAccess != 0,
+		write:    desired&sharingWriteAccess != 0,
+		del:      desired&sharingDeleteAccess != 0,
+		attrOnly: desired&^sharingAttrOnlyAccess == 0,
+		shared:   share,
 	}
 }
 
@@ -93,6 +113,11 @@ func newShareModeEntry(owner *Open, desired, share uint32) shareModeEntry {
 // open shares, AND what the existing open is doing must be permitted by what
 // the newcomer shares. Either violation is STATUS_SHARING_VIOLATION.
 func shareConflict(existing, incoming shareModeEntry) bool {
+	// Opens that disagree about being attribute-only never conflict, in either
+	// direction. See sharingAttrOnlyAccess.
+	if existing.attrOnly != incoming.attrOnly {
+		return false
+	}
 	// Does the existing open let the newcomer in?
 	if incoming.read && existing.shared&shareAccessRead == 0 {
 		return true

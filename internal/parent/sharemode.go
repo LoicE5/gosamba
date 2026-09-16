@@ -60,6 +60,22 @@ const (
 	sharingDeleteAccess = accDelete | smb2.AccessGenericAll
 )
 
+// sharingAttrOnlyAccess is the set of DesiredAccess bits that, on their own,
+// make an open "attribute only": it reads or writes metadata and never touches
+// the file's data or its name.
+//
+// Two opens that disagree on this are exempt from the sharing check entirely,
+// in both directions — an attribute open neither trips another handle's deny
+// mode nor imposes its own. macOS issues these constantly (DesiredAccess
+// 0x00100080 = SYNCHRONIZE|FILE_READ_ATTRIBUTES is all over a normal trace)
+// and smbfs_get_rights_shareMode can hand them a deny-all ShareAccess, so
+// honouring that deny mode refuses ordinary data opens on behalf of a handle
+// that is not reading or writing anything. ksmbd draws the same exemption:
+// fp->attrib_only in fs/smb/server/smb2pdu.c and the
+// "prev_fp->attrib_only != curr_fp->attrib_only" skip in
+// fs/smb/server/smb_common.c.
+const sharingAttrOnlyAccess = accFileReadAttributes | accFileWriteAttributes | accSynchronize
+
 // shareModeEntry is one live open's contribution to a file's share state: what
 // it asked to do, and what it will let others do.
 //
@@ -71,20 +87,24 @@ const (
 // open. On Windows the granted mask equals the requested one, so checking the
 // request is the faithful reading of §3.3.5.9 for this server.
 type shareModeEntry struct {
-	owner  *Open
-	read   bool
-	write  bool
-	del    bool
-	shared uint32 // the open's ShareAccess mask
+	owner *Open
+	read  bool
+	write bool
+	del   bool
+	// attrOnly marks an open whose DesiredAccess is entirely within
+	// sharingAttrOnlyAccess. See that constant for why it is exempt.
+	attrOnly bool
+	shared   uint32 // the open's ShareAccess mask
 }
 
 func newShareModeEntry(owner *Open, desired, share uint32) shareModeEntry {
 	return shareModeEntry{
-		owner:  owner,
-		read:   desired&sharingReadAccess != 0,
-		write:  desired&sharingWriteAccess != 0,
-		del:    desired&sharingDeleteAccess != 0,
-		shared: share,
+		owner:    owner,
+		read:     desired&sharingReadAccess != 0,
+		write:    desired&sharingWriteAccess != 0,
+		del:      desired&sharingDeleteAccess != 0,
+		attrOnly: desired&^sharingAttrOnlyAccess == 0,
+		shared:   share,
 	}
 }
 
@@ -93,6 +113,11 @@ func newShareModeEntry(owner *Open, desired, share uint32) shareModeEntry {
 // open shares, AND what the existing open is doing must be permitted by what
 // the newcomer shares. Either violation is STATUS_SHARING_VIOLATION.
 func shareConflict(existing, incoming shareModeEntry) bool {
+	// Opens that disagree about being attribute-only never conflict, in either
+	// direction. See sharingAttrOnlyAccess.
+	if existing.attrOnly != incoming.attrOnly {
+		return false
+	}
 	// Does the existing open let the newcomer in?
 	if incoming.read && existing.shared&shareAccessRead == 0 {
 		return true
@@ -116,6 +141,19 @@ func shareConflict(existing, incoming shareModeEntry) bool {
 	return false
 }
 
+// shareWaiter is one CREATE parked on another handle's deny mode, waiting for
+// the wake that releasing it sends.
+//
+// The wait is edge-triggered rather than polled on purpose: retrying by
+// re-running the CREATE would re-resolve the path and re-open the descriptor —
+// roughly a dozen metadata syscalls an attempt — for a condition that lives
+// entirely in this table. A waiter sleeps until a release on its key actually
+// happens, and retries only the in-memory test.
+type shareWaiter struct {
+	key fileKey
+	ch  chan struct{}
+}
+
 // shareModeTable is the process-global set of live share reservations.
 //
 // byFile is the conflict index; owners is the reverse index that makes release
@@ -126,12 +164,16 @@ type shareModeTable struct {
 	mu     sync.Mutex
 	byFile map[fileKey][]shareModeEntry
 	owners map[*Open]fileKey
+	// waiters are the CREATEs parked on each file, woken when a reservation on
+	// that file is given up. Empty in the overwhelmingly common case.
+	waiters map[fileKey][]*shareWaiter
 }
 
 func newShareModeTable() *shareModeTable {
 	return &shareModeTable{
-		byFile: make(map[fileKey][]shareModeEntry),
-		owners: make(map[*Open]fileKey),
+		byFile:  make(map[fileKey][]shareModeEntry),
+		owners:  make(map[*Open]fileKey),
+		waiters: make(map[fileKey][]*shareWaiter),
 	}
 }
 
@@ -212,11 +254,18 @@ func entryLive(e shareModeEntry, key fileKey) bool {
 // check runs the sharing-access test for a hypothetical open of key without
 // reserving anything. handleCreate uses it before a disposition that would
 // truncate or replace the file, so a refused open cannot destroy data on its
-// way to being refused. The authoritative test is acquire.
+// way to being refused. It deliberately does not wait out a transient
+// conflict — see the call site in dispatch.go. The authoritative test is
+// acquireLocked, reached through acquireShareMode.
 func (t *shareModeTable) check(key fileKey, desired, share uint32) bool {
-	probe := newShareModeEntry(nil, desired, share)
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.checkLocked(key, desired, share)
+}
+
+// checkLocked is check's body. The caller holds t.mu.
+func (t *shareModeTable) checkLocked(key fileKey, desired, share uint32) bool {
+	probe := newShareModeEntry(nil, desired, share)
 	for _, e := range t.byFile[key] {
 		if !entryLive(e, key) {
 			continue
@@ -228,16 +277,16 @@ func (t *shareModeTable) check(key fileKey, desired, share uint32) bool {
 	return true
 }
 
-// acquire runs the sharing-access test against every live open of key and, if
-// it passes, records o's reservation. It returns false when the open must be
-// refused with STATUS_SHARING_VIOLATION; nothing is recorded in that case.
+// acquireLocked runs the sharing-access test against every live open of key
+// and, if it passes, records o's reservation. It returns false when the open
+// must be refused; the caller (acquireOrWait, via acquireShareMode) is what
+// turns that into STATUS_SHARING_VIOLATION or a parked wait. Nothing is
+// recorded when it returns false.
 //
 // Test and insert happen under one lock so two clients racing on the same file
-// cannot both be admitted.
-func (t *shareModeTable) acquire(key fileKey, o *Open, desired, share uint32) bool {
+// cannot both be admitted. The caller holds t.mu.
+func (t *shareModeTable) acquireLocked(key fileKey, o *Open, desired, share uint32) bool {
 	incoming := newShareModeEntry(o, desired, share)
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	if _, dup := t.owners[o]; dup {
 		// Already holds a reservation; never let one handle occupy two slots.
 		return true
@@ -284,6 +333,9 @@ func (t *shareModeTable) release(o *Open) {
 		kept = append(kept, e)
 	}
 	t.store(key, kept)
+	// This file just gave up a reservation, so a CREATE parked on it may now
+	// get in. Waking under the lock is safe: wakeLocked only closes channels.
+	t.wakeLocked(key)
 }
 
 // transfer moves a reservation from one *Open to another without ever giving up
@@ -331,4 +383,59 @@ func (t *shareModeTable) len() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.owners)
+}
+
+// acquireOrWait is acquireLocked plus, on refusal, a registration for the wake
+// that releasing the conflicting reservation will send. Test and registration
+// happen under one lock so a release landing between the two cannot be missed —
+// which is the whole reason this is not "acquire, then subscribe".
+func (t *shareModeTable) acquireOrWait(key fileKey, o *Open, desired, share uint32) (bool, *shareWaiter) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.acquireLocked(key, o, desired, share) {
+		return true, nil
+	}
+	return false, t.registerWaiterLocked(key)
+}
+
+func (t *shareModeTable) registerWaiterLocked(key fileKey) *shareWaiter {
+	w := &shareWaiter{key: key, ch: make(chan struct{})}
+	t.waiters[key] = append(t.waiters[key], w)
+	return w
+}
+
+// unwait drops a registration a waiter is giving up on. It must be called on
+// every path that stops waiting without being woken, or the table accumulates
+// a channel per abandoned CREATE.
+func (t *shareModeTable) unwait(w *shareWaiter) {
+	if w == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ws := t.waiters[w.key]
+	for i, x := range ws {
+		if x == w {
+			ws = append(ws[:i], ws[i+1:]...)
+			if len(ws) == 0 {
+				delete(t.waiters, w.key)
+			} else {
+				t.waiters[w.key] = ws
+			}
+			return
+		}
+	}
+}
+
+// wakeLocked wakes everyone parked on key and clears the list. A woken waiter
+// is no longer registered, so it re-registers if it has to wait again.
+func (t *shareModeTable) wakeLocked(key fileKey) {
+	ws := t.waiters[key]
+	if len(ws) == 0 {
+		return
+	}
+	delete(t.waiters, key)
+	for _, w := range ws {
+		close(w.ch)
+	}
 }

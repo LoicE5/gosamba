@@ -693,3 +693,57 @@ func TestFixShareMode_ConcurrentOpensAndCloses(t *testing.T) {
 	}
 	// The fixture's cleanup asserts every reservation was released.
 }
+
+// --- an attribute-only open must not hold a deny mode ---
+//
+// macOS opens files for attributes alone constantly (DesiredAccess
+// 0x00100080 = SYNCHRONIZE|FILE_READ_ATTRIBUTES shows up all over a Finder or
+// git trace), and smbfs_get_rights_shareMode can pair that with a deny-all
+// ShareAccess. Honouring that deny mode blocks ordinary data opens for a
+// handle that is not reading or writing anything. ksmbd skips the whole
+// sharing check when the two opens disagree on attrib_only
+// (fs/smb/server/smb_common.c:665).
+
+const wantAttrsAndSync = smb2.AccessFileReadAttributes | accSynchronize
+
+func TestFixShareMode_AttributeOnlyOpenHoldsNoDenyMode(t *testing.T) {
+	f := newShareModeFixture(t)
+	f.writeFile("doc.txt", "body")
+
+	// A deny-all attribute-only open must not block a data open.
+	attrs := f.mustOpen("doc.txt", wantAttrsAndSync, shareNone)
+	data := f.mustOpen("doc.txt", wantReadWrite, shareAll)
+
+	if f.close(data) != smb2.StatusSuccess || f.close(attrs) != smb2.StatusSuccess {
+		t.Fatal("CLOSE failed")
+	}
+	f.assertNoReservations("both handles closed")
+}
+
+func TestFixShareMode_DataOpenDoesNotBlockAttributeOnlyOpen(t *testing.T) {
+	f := newShareModeFixture(t)
+	f.writeFile("doc.txt", "body")
+
+	// The other direction: a deny-all data open must not block a pure
+	// attribute open, which is how macOS stats a file someone else is using.
+	data := f.mustOpen("doc.txt", wantReadWrite, shareNone)
+	attrs := f.mustOpen("doc.txt", wantAttrsAndSync, shareNone)
+
+	if f.close(attrs) != smb2.StatusSuccess || f.close(data) != smb2.StatusSuccess {
+		t.Fatal("CLOSE failed")
+	}
+	f.assertNoReservations("both handles closed")
+}
+
+func TestFixShareMode_TwoDataOpensStillConflict(t *testing.T) {
+	// The exemption must not leak into the case the check exists for.
+	f := newShareModeFixture(t)
+	f.writeFile("locked.txt", "body")
+
+	exclusive := f.mustOpen("locked.txt", wantReadWrite, shareNone)
+	f.assertViolation("locked.txt", wantRead, shareAll)
+	if f.close(exclusive) != smb2.StatusSuccess {
+		t.Fatal("CLOSE failed")
+	}
+	f.assertNoReservations("the exclusive handle closed")
+}

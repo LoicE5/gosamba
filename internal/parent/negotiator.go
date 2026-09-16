@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/ahmetozer/gosamba/internal/smb2"
@@ -42,6 +43,14 @@ type Connection struct {
 	// to the opens they name, for FSCTL_SRV_COPYCHUNK. It lives on the
 	// connection so the keys die with it; see copychunk.go.
 	resumeKeys resumeKeyTable
+
+	// sharingWaits counts the CREATEs this connection currently has parked on
+	// another handle's deny mode. A parked CREATE holds one of the connection's
+	// bounded worker-pool slots (see connPool.submit, which stops reading
+	// frames when they are all busy), so the count is capped at
+	// maxSharingWaits and everything past the cap is refused immediately —
+	// exactly as it was before the wait existed.
+	sharingWaits atomic.Int32
 
 	// AAPLReadDirAttr latches once the client has negotiated AAPL with
 	// SUPPORTS_READ_DIR_ATTR. Subsequent QUERY_DIRECTORY level-37 responses

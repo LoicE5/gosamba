@@ -451,12 +451,34 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 	// this op is referencing that handle, inherit the prior status (per
 	// MS-SMB2 §3.3.5.2.7) — otherwise we'd send INVALID_PARAMETER and
 	// confuse clients (Finder reads it as a permission fault).
+	//
+	// The one op that must never be swallowed that way is a CLOSE naming a
+	// handle this chain actually opened. macOS sends CREATE/SomeOp/CLOSE as one
+	// related chain for almost everything it does, so a failure in the middle
+	// used to leave the handle in the session's map with its descriptor, its
+	// byte-range locks and its share-mode reservation held until the connection
+	// died. In the delete chain (CREATE / SET_INFO FileDispositionInformation /
+	// CLOSE) macOS opens deny-all, so that stranded reservation made the file
+	// unopenable by every client on every connection.
+	//
+	// ksmbd draws the line in the same place: it stores the chain's FID only
+	// when the CREATE succeeded, resolves a sentinel CLOSE against it and
+	// executes the close whatever an earlier member did, then clears the FID so
+	// a later sentinel op in the same chain finds nothing
+	// (fs/smb/server/smb2pdu.c, smb2_close).
 	if hdr.Flags&smb2.FlagRelatedOps != 0 {
-		if d.lastChainStatus != smb2.StatusSuccess && hasPreviousHandleSentinel(hdr.Command, body) {
+		sentinel := hasPreviousHandleSentinel(hdr.Command, body)
+		closesLiveHandle := sentinel && d.HasLastCreated && hdr.Command == smb2.CommandClose
+		if sentinel && d.lastChainStatus != smb2.StatusSuccess && !closesLiveHandle {
 			d.respondError(rw, hdr, d.lastChainStatus, sess)
 			return true
 		}
 		d.SubstitutePreviousHandleFileID(hdr.Command, body)
+		if closesLiveHandle {
+			// The handle is consumed; a second sentinel op in this chain names
+			// nothing and falls back to the inherited-status arm above.
+			d.HasLastCreated = false
+		}
 	}
 
 	// Frames run concurrently, so two messages can now reach the same handle at
@@ -851,8 +873,14 @@ func (d *Dispatcher) releaseOpens(opens []*Open) {
 // one message; the two commands that would park — CHANGE_NOTIFY and a blocking
 // LOCK — register their wait and return, so neither holds it while parked
 // (releaseOpens wakes both before it reaches this loop anyway); and no handler
-// ever waits on the socket, which belongs to the writer goroutine. So the
-// longest this can wait is one message's worth of file I/O.
+// ever waits on the socket, which belongs to the writer goroutine. CREATE is a
+// third command that can park, on a sharing conflict, but that wait is
+// upstream of this lock: fileIDOffsetInBody(CommandCreate) is -1, so
+// lockOpenForMessage returns nil for CREATE, and handleCreate does not take
+// open.mu until after acquireShareMode has already returned. A future change
+// must keep that ordering — moving the wait below open.mu.Lock() would let a
+// parked CREATE hold the lock for up to sharingViolationWait. So the longest
+// this can wait is one message's worth of file I/O.
 //
 // A bounded wait was tried and removed. Giving up and releasing anyway means
 // writing o.File while a reader may still be in the handler — a data race the
@@ -1169,6 +1197,17 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// FILE_CREATE on an existing name must still report
 	// STATUS_OBJECT_NAME_COLLISION — and the non-truncating dispositions have
 	// nothing to protect, since they do not touch the file before the acquire.
+	//
+	// This check deliberately does NOT wait out a transient conflict the way
+	// the acquire below does. It reserves nothing, so several CREATEs parked
+	// here would all be woken by the same release, all re-run this check
+	// against a now-empty entry list, all pass, and all truncate the file —
+	// after which only one of them would go on to win the acquire, having
+	// already destroyed the data on its way to being refused. Absorbing the
+	// wait belongs solely in the authoritative acquire, whose test-and-reserve
+	// is atomic. (The macOS delete chain this package's sharing-wait exists for
+	// opens with FILE_OPEN, not a truncating disposition, so nothing that wait
+	// was built for depends on this pre-check waiting too.)
 	if truncatingDisposition(req.CreateDisposition) && exists && !isDir {
 		if key, ok := shareKeyForPath(osPath); ok &&
 			!sharedShareModes.check(key, req.DesiredAccess, req.ShareAccess) {
@@ -1376,7 +1415,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// leave the reservation behind.
 	if shareModeApplies(open) {
 		key, keyOK := shareKeyForFd(int(open.File.Fd()))
-		if keyOK && !sharedShareModes.acquire(key, open, req.DesiredAccess, req.ShareAccess) {
+		if keyOK && !d.acquireShareMode(key, open, req.DesiredAccess, req.ShareAccess) {
 			// Refused: hand back the descriptor before answering, or the fd
 			// leaks for the life of the process.
 			open.File.Close()
@@ -1406,18 +1445,24 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// seen it.
 	open.mu.Lock()
 	defer open.mu.Unlock()
-	if !sess.AddOpen(open) {
-		// The session was torn down while this CREATE was running — a LOGOFF,
-		// the connection dropping, or a reconnect on another connection naming
-		// it in PreviousSessionId. Everything acquired above belongs to nobody
-		// now: the handle is not in any session's map, so no CLOSE, no
-		// TREE_DISCONNECT and no teardown will ever reach it. Give it all back
-		// here or the descriptor and the share-mode reservation are held for
-		// the life of the process, and a leaked reservation makes the file
-		// unopenable by every client. The durable registration happens below
-		// this point, so there is no durable entry to retire.
-		d.Log.Warn("session torn down under an in-flight CREATE; releasing the handle",
-			"path", osPath, "session_id", hdr.SessionID)
+	if !sess.AddOpenToTree(open, hdr.TreeID) {
+		// The session was torn down, or this tree was disconnected, while this
+		// CREATE was running — a LOGOFF, the connection dropping, a reconnect
+		// on another connection naming it in PreviousSessionId, or a
+		// TREE_DISCONNECT for hdr.TreeID racing this CREATE on another frame
+		// of the same connection. A CREATE that lost a sharing conflict can
+		// park for up to sharingViolationWait before reaching this point, so
+		// checking the tree here (not just at resolve time, above) is what
+		// keeps a TREE_DISCONNECT that lands during that wait from being
+		// missed. Everything acquired above belongs to nobody now: the handle
+		// is not in any session's map, so no CLOSE, no TREE_DISCONNECT and no
+		// teardown will ever reach it. Give it all back here or the descriptor
+		// and the share-mode reservation are held for the life of the
+		// process, and a leaked reservation makes the file unopenable by
+		// every client. The durable registration happens below this point, so
+		// there is no durable entry to retire.
+		d.Log.Warn("session torn down or tree disconnected under an in-flight CREATE; releasing the handle",
+			"path", osPath, "session_id", hdr.SessionID, "tree_id", hdr.TreeID)
 		releaseOpen(open)
 		open.File = nil
 		d.respondError(rw, hdr, smb2.StatusUserSessionDeleted, sess)

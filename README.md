@@ -47,13 +47,45 @@ watch very large trees and want the cap to scale with it.
 
 ## Build
 
-Requires Go 1.25 or newer.
+Requires Go 1.26 or newer.
 
 ```sh
 make build        # produces ./gosamba
 # or
 go build -o gosamba ./cmd/gosamba
 ```
+
+### Container
+
+The container runs as numeric UID/GID `65532:65532`, listens on the
+unprivileged container port `1445`, and disables mDNS by default. Build it and
+publish the standard SMB port on the host with:
+
+```sh
+docker build -t gosamba:local .
+docker run --rm \
+  --publish 445:1445 \
+  --mount type=bind,source=/srv/files,target=/shares/public \
+  gosamba:local \
+  --listen :1445 \
+  --mdns=false \
+  --share /shares/public=public \
+  --user alice:s3cret
+```
+
+Arguments after the image name replace the image defaults, so include
+`--listen :1445` and `--mdns=false` when supplying command-line shares or
+users. Pass `--mdns=true` instead if container networking is configured to
+support mDNS.
+
+Bind-mounted shares must be readable by UID/GID `65532:65532`, and writable by
+that identity for read-write shares. To use the host user's permissions
+instead, set Docker's runtime user before the image name, for example
+`--user "$(id -u):$(id -g)"`. This Docker option is separate from gosamba's
+`--user alice:s3cret` application option, which defines an SMB login and comes
+after the image name. On rootless Docker installations that cannot publish
+privileged host ports, use `--publish 1445:1445` or configure the host to allow
+binding port 445.
 
 ## Quick start
 

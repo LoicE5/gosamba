@@ -8,3 +8,6 @@
 !.github
 !.gitignore
 !.dockerignore
+downloaded-builds/
+AUDIT*.md
+PLAN.md

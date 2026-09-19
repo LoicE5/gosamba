@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -18,8 +18,11 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 FROM scratch
 COPY --from=build /out/gosamba /usr/local/bin/gosamba
 
-# SMB over direct TCP. Binding :445 requires the container to run as root
-# (the default) or with NET_BIND_SERVICE.
-EXPOSE 445
+# The numeric identity also works in scratch, which has no /etc/passwd.
+USER 65532:65532
+
+# Publish host port 445 to this unprivileged container port.
+EXPOSE 1445
 
 ENTRYPOINT ["/usr/local/bin/gosamba"]
+CMD ["--listen", ":1445", "--mdns=false"]

@@ -183,6 +183,9 @@ type Session struct {
 	// soon as authentication completes.
 	ntlmNegotiate []byte
 	ntlmChallenge []byte
+	// spnegoWrapped records the token envelope chosen by the client so the
+	// server uses the same envelope throughout the authentication exchange.
+	spnegoWrapped bool
 
 	mu    sync.Mutex
 	trees map[uint32]*Tree
@@ -559,7 +562,7 @@ func (h *SessionSetupHandler) HandleSessionSetup(rw io.ReadWriter, hdr smb2.Head
 	if err != nil {
 		return nil, fmt.Errorf("decode session-setup: %w", err)
 	}
-	ntlmMsg, err := smb2.UnwrapNTLM(req.SecurityBuffer)
+	ntlmMsg, spnegoWrapped, err := smb2.UnwrapNTLMWithSPNEGO(req.SecurityBuffer)
 	if err != nil {
 		return nil, err
 	}
@@ -567,10 +570,15 @@ func (h *SessionSetupHandler) HandleSessionSetup(rw io.ReadWriter, hdr smb2.Head
 		return nil, errors.New("ntlm message too short")
 	}
 	msgType := uint32(ntlmMsg[8]) | uint32(ntlmMsg[9])<<8 | uint32(ntlmMsg[10])<<16 | uint32(ntlmMsg[11])<<24
+	h.Log.Debug("session setup token",
+		"message_type", msgType,
+		"spnego", spnegoWrapped,
+		"security_buffer_length", len(req.SecurityBuffer),
+	)
 
 	switch msgType {
 	case ntlm.MessageTypeNegotiate:
-		return h.handleType1(rw, hdr, ntlmMsg, fullRequestFrame)
+		return h.handleType1(rw, hdr, ntlmMsg, spnegoWrapped, fullRequestFrame)
 	case ntlm.MessageTypeAuthenticate:
 		// PreviousSessionId is honoured inside handleType3, between the point
 		// where the client has proved who it is and the point where it is told
@@ -612,7 +620,7 @@ func (h *SessionSetupHandler) closePreviousSession(prevID uint64, sess *Session)
 	h.Index.supersede(prevID, sess, guid, h.Log)
 }
 
-func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, type1, requestFrame []byte) (*Session, error) {
+func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, type1 []byte, spnegoWrapped bool, requestFrame []byte) (*Session, error) {
 	sess, err := h.Sessions.NewHalfOpen()
 	if err != nil {
 		return nil, err
@@ -646,12 +654,16 @@ func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, typ
 	// put after the token. type2 is verbatim what we are about to send.
 	sess.ntlmNegotiate = append([]byte(nil), type1...)
 	sess.ntlmChallenge = append([]byte(nil), type2...)
+	sess.spnegoWrapped = spnegoWrapped
 
-	spnego := smb2.WrapNTLMResp(smb2.SPNEGOAcceptIncomplete, type2)
+	securityBuffer := type2
+	if spnegoWrapped {
+		securityBuffer = smb2.WrapNTLMResp(smb2.SPNEGOAcceptIncomplete, type2)
+	}
 
 	respBody := smb2.EncodeSessionSetupResponse(smb2.SessionSetupResponse{
 		SessionFlags:   0,
-		SecurityBuffer: spnego,
+		SecurityBuffer: securityBuffer,
 	})
 	respHdr := smb2.Header{
 		CreditCharge:   hdr.CreditCharge,
@@ -813,10 +825,13 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 		// either case would ask for something the client cannot do.
 		sessFlags = smb2.SessionFlagEncryptData
 	}
-	spnego := smb2.WrapNTLMResp(smb2.SPNEGOAcceptCompleted, nil)
+	var securityBuffer []byte
+	if sess.spnegoWrapped {
+		securityBuffer = smb2.WrapNTLMResp(smb2.SPNEGOAcceptCompleted, nil)
+	}
 	respBody := smb2.EncodeSessionSetupResponse(smb2.SessionSetupResponse{
 		SessionFlags:   sessFlags,
-		SecurityBuffer: spnego,
+		SecurityBuffer: securityBuffer,
 	})
 	hdrFlags := smb2.FlagServerToRedir
 	if !isGuest {

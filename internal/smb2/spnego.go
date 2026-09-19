@@ -51,14 +51,25 @@ var ntlmsspMagic = []byte{'N', 'T', 'L', 'M', 'S', 'S', 'P', 0x00}
 // a bare NTLMSSP message in the security buffer, and for those the blob is the
 // message.
 func UnwrapNTLM(blob []byte) ([]byte, error) {
+	tok, _, err := UnwrapNTLMWithSPNEGO(blob)
+	return tok, err
+}
+
+// UnwrapNTLMWithSPNEGO returns the NTLMSSP message carried by blob and reports
+// whether it was inside a well-formed SPNEGO token. SMB clients are found in
+// both forms: Windows and macOS normally use SPNEGO, while libsmb2 can send a
+// bare NTLMSSP token. A server has to preserve that choice in its challenge;
+// wrapping a reply to a bare token makes older libsmb2 clients abort the
+// authentication exchange.
+func UnwrapNTLMWithSPNEGO(blob []byte) ([]byte, bool, error) {
 	if tok, ok := spnegoInnerToken(blob); ok && bytes.HasPrefix(tok, ntlmsspMagic) {
-		return tok, nil
+		return tok, true, nil
 	}
 	idx := bytes.Index(blob, ntlmsspMagic)
 	if idx < 0 {
-		return nil, errors.New("smb2: NTLMSSP message not found in SPNEGO blob")
+		return nil, false, errors.New("smb2: NTLMSSP message not found in SPNEGO blob")
 	}
-	return blob[idx:], nil
+	return blob[idx:], false, nil
 }
 
 // spnegoInnerToken extracts the [2] element (mechToken of a NegTokenInit, or

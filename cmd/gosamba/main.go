@@ -189,16 +189,17 @@ func run(args []string) error {
 		if err == nil {
 			var portNum int
 			fmt.Sscanf(port, "%d", &portNum)
-			instance, _ := os.Hostname()
-			if host == "" || host == "0.0.0.0" {
-				h, _ := os.Hostname()
-				host = h
-			}
-			mdnsCloser, mdnsErr := discovery.Advertise(ctx, instance, host, portNum, log)
-			if mdnsErr != nil {
-				log.Debug("mDNS advertise failed (continuing without it)", "err", mdnsErr)
+			localHostname, hostnameErr := os.Hostname()
+			if hostnameErr != nil {
+				log.Debug("mDNS hostname lookup failed (continuing without it)", "err", hostnameErr)
 			} else {
-				defer mdnsCloser.Close()
+				instance, advertiseHost := bonjourNames(host, localHostname)
+				mdnsCloser, mdnsErr := discovery.Advertise(ctx, instance, advertiseHost, portNum, log)
+				if mdnsErr != nil {
+					log.Debug("mDNS advertise failed (continuing without it)", "err", mdnsErr)
+				} else {
+					defer mdnsCloser.Close()
+				}
 			}
 		}
 	}
@@ -235,6 +236,27 @@ func run(args []string) error {
 	}
 	log.Info("gosamba stopped")
 	return nil
+}
+
+// bonjourNames returns an instance label and SRV target host without the
+// .local suffix that discovery.Advertise appends. Wildcard listen addresses
+// are not usable DNS names, so they resolve to the machine hostname.
+func bonjourNames(listenerHost, localHostname string) (instance, hostname string) {
+	instance = trimLocalSuffix(localHostname)
+	hostname = listenerHost
+	if ip := net.ParseIP(listenerHost); listenerHost == "" || (ip != nil && ip.IsUnspecified()) {
+		hostname = localHostname
+	}
+	hostname = trimLocalSuffix(hostname)
+	return instance, hostname
+}
+
+func trimLocalSuffix(hostname string) string {
+	hostname = strings.TrimSuffix(hostname, ".")
+	if len(hostname) >= len(".local") && strings.EqualFold(hostname[len(hostname)-len(".local"):], ".local") {
+		hostname = hostname[:len(hostname)-len(".local")]
+	}
+	return hostname
 }
 
 func hasPlaintextPasswordFlag(args []string) bool {

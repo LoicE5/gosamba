@@ -2,16 +2,46 @@ package parent
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ahmetozer/gosamba/internal/smb2"
 	"github.com/ahmetozer/gosamba/internal/transport"
 )
+
+const serverGuidEnvKey = "GOSAMBA_SERVER_GUID"
+
+var (
+	processServerGuidOnce sync.Once
+	processServerGuid     [16]byte
+	processServerGuidErr  error
+)
+
+// serverGuid returns the process-wide server identity. MS-SMB2 defines this as
+// a global value, not a per-connection nonce. Re-exec workers receive the same
+// value through serverGuidEnvKey (see worker.go).
+func serverGuid() ([16]byte, error) {
+	processServerGuidOnce.Do(func() {
+		if encoded := os.Getenv(serverGuidEnvKey); IsWorker() && encoded != "" {
+			decoded, err := hex.DecodeString(encoded)
+			if err != nil || len(decoded) != len(processServerGuid) {
+				processServerGuidErr = fmt.Errorf("invalid %s", serverGuidEnvKey)
+				return
+			}
+			copy(processServerGuid[:], decoded)
+			return
+		}
+		_, processServerGuidErr = rand.Read(processServerGuid[:])
+	})
+	return processServerGuid, processServerGuidErr
+}
 
 // Connection holds per-TCP-connection state established during NEGOTIATE.
 type Connection struct {
@@ -81,14 +111,20 @@ type NegotiatorOptions struct {
 // an SMB1 NEGOTIATE_PROTOCOL, reply with DialectRevision=0x02FF and loop back
 // to read the real SMB2 NEGOTIATE.
 func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Connection, error) {
+	guid, err := serverGuid()
+	if err != nil {
+		return nil, fmt.Errorf("server guid: %w", err)
+	}
+
 	frame, err := transport.ReadFrame(rw, transport.MaxFrameSize)
 	if err != nil {
 		return nil, fmt.Errorf("read negotiate frame: %w", err)
 	}
-	if len(frame) >= 4 && frame[0] == 0xFF && frame[1] == 'S' && frame[2] == 'M' && frame[3] == 'B' {
+	multiProtocol := len(frame) >= 4 && frame[0] == 0xFF && frame[1] == 'S' && frame[2] == 'M' && frame[3] == 'B'
+	if multiProtocol {
 		// SMB1 multi-protocol NEGOTIATE.
 		log.Info("smb1 multi-protocol negotiate; upgrading to SMB2")
-		if err := writeMultiProtocolUpgradeResponse(rw, opts); err != nil {
+		if err := writeMultiProtocolUpgradeResponse(rw, opts, guid); err != nil {
 			return nil, fmt.Errorf("write smb2 upgrade response: %w", err)
 		}
 		// The client's next frame will be a real SMB2 NEGOTIATE.
@@ -111,6 +147,17 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 	if err != nil {
 		return nil, fmt.Errorf("decode negotiate body: %w", err)
 	}
+	path := "direct_smb2"
+	if multiProtocol {
+		path = "smb1_upgrade"
+	}
+	log.Debug("negotiate request",
+		"path", path,
+		"dialects", formatDialects(req.Dialects),
+		"ciphers", formatCiphers(req.Encryption),
+		"signing_algorithms", formatSigningAlgorithms(req.SigningCaps),
+		"response_authentication", "spnego/ntlmssp",
+	)
 
 	sel, err := smb2.Select(req, opts.RequireEncryption)
 	if err != nil {
@@ -119,11 +166,9 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 
 	conn := &Connection{
 		ClientGuid: req.ClientGuid,
+		ServerGuid: guid,
 		Selection:  sel,
 		Preauth:    smb2.NewPreauthHash(),
-	}
-	if _, err := rand.Read(conn.ServerGuid[:]); err != nil {
-		return nil, fmt.Errorf("server guid: %w", err)
 	}
 
 	conn.NegotiateRequestMsg = append([]byte(nil), frame...)
@@ -190,7 +235,7 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 	}
 
 	respHdr := smb2.Header{
-		CreditCharge:   1,
+		CreditCharge:   hdr.CreditCharge,
 		Command:        smb2.CommandNegotiate,
 		CreditResponse: grantCredits(hdr.CreditCharge, hdr.CreditResponse),
 		Flags:          smb2.FlagServerToRedir,
@@ -219,6 +264,36 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 	return conn, nil
 }
 
+func formatDialects(dialects []smb2.Dialect) []string {
+	out := make([]string, len(dialects))
+	for i, dialect := range dialects {
+		out[i] = fmt.Sprintf("0x%04x", uint16(dialect))
+	}
+	return out
+}
+
+func formatCiphers(ctx *smb2.EncryptionContext) []string {
+	if ctx == nil {
+		return nil
+	}
+	out := make([]string, len(ctx.Ciphers))
+	for i, cipher := range ctx.Ciphers {
+		out[i] = fmt.Sprintf("0x%04x", uint16(cipher))
+	}
+	return out
+}
+
+func formatSigningAlgorithms(ctx *smb2.SigningCapsContext) []string {
+	if ctx == nil {
+		return nil
+	}
+	out := make([]string, len(ctx.Algorithms))
+	for i, algorithm := range ctx.Algorithms {
+		out[i] = fmt.Sprintf("0x%04x", uint16(algorithm))
+	}
+	return out
+}
+
 // filetimeNow returns the current time as Windows FILETIME.
 func filetimeNow() uint64 {
 	const epochDelta = 11644473600
@@ -232,45 +307,43 @@ var ErrNegotiate = errors.New("negotiate")
 // writeMultiProtocolUpgradeResponse writes the SMB2 NEGOTIATE response with
 // DialectRevision=0x02FF that tells a multi-protocol-negotiating client
 // (macOS Finder, Windows pre-SMB2-only clients) to send a real SMB2 NEGOTIATE
-// next. Per MS-SMB2 §3.3.5.3.1: no negotiate contexts, no security buffer.
-func writeMultiProtocolUpgradeResponse(rw io.ReadWriter, opts NegotiatorOptions) error {
-	const dialect02FF = 0x02FF
+// next. It is a normal pre-3.1.1 NEGOTIATE response (including the server's
+// security-mechanism blob) but has no negotiate contexts. The same ServerGuid
+// is reused by the real response on this connection.
+func writeMultiProtocolUpgradeResponse(rw io.ReadWriter, opts NegotiatorOptions, serverGuid [16]byte) error {
+	const dialect02FF smb2.Dialect = 0x02FF
 
-	// 64-byte body (StructureSize=65 includes one variable byte, but we send no
-	// security buffer or contexts so the body stays at 64 bytes).
-	body := make([]byte, 64)
-	body[0] = 65
-	// SecurityMode: signing enabled (don't require — the client hasn't picked).
-	body[2] = 0x01
-	// DialectRevision = 0x02FF
-	body[4], body[5] = 0xFF, 0x02
-	// NegotiateContextCount = 0
-	// ServerGuid: random
-	if _, err := rand.Read(body[8:24]); err != nil {
+	maxIO := opts.MaxIOSize
+	if maxIO == 0 {
+		maxIO = 8 << 20
+	}
+	securityMode := uint16(smb2.NegotiateSigningEnabled)
+	if opts.RequireSigning {
+		securityMode |= smb2.NegotiateSigningRequired
+	}
+	body, err := smb2.EncodeNegotiateResponse(smb2.NegotiateResponse{
+		SecurityMode:    securityMode,
+		Dialect:         dialect02FF,
+		ServerGuid:      serverGuid,
+		Capabilities:    smb2.CapLargeMTU,
+		MaxTransactSize: maxIO,
+		MaxReadSize:     maxIO,
+		MaxWriteSize:    maxIO,
+		SystemTime:      filetimeNow(),
+		ServerStartTime: 0,
+		SecurityBuffer:  smb2.NegotiateSecurityBlob,
+	})
+	if err != nil {
 		return err
 	}
-	// Capabilities = 0
-	// MaxTransactSize / MaxReadSize / MaxWriteSize: reasonable defaults
-	for _, off := range []int{28, 32, 36} {
-		body[off] = 0x00
-		body[off+1] = 0x00
-		body[off+2] = 0x10
-		body[off+3] = 0x00 // 1 MiB
-	}
-	// SystemTime
-	t := filetimeNow()
-	for i := 0; i < 8; i++ {
-		body[40+i] = byte(t >> (8 * i))
-	}
-	// ServerStartTime, SecurityBuffer*, NegotiateContextOffset all zero.
 
 	// For SMB1 multi-protocol upgrade, there's no SMB2 credit request from the
 	// client. Grant a small initial window; the real SMB2 NEGOTIATE response
 	// will grow it based on the client's actual request.
 	respHdr := smb2.Header{
-		CreditCharge:   1,
+		CreditCharge:   0,
 		Command:        smb2.CommandNegotiate,
-		CreditResponse: grantCredits(1, 1),
+		CreditResponse: 1,
 		Flags:          smb2.FlagServerToRedir,
 		MessageID:      0,
 	}
@@ -279,6 +352,5 @@ func writeMultiProtocolUpgradeResponse(rw io.ReadWriter, opts NegotiatorOptions)
 		return err
 	}
 	copy(full[smb2.HeaderSize:], body)
-	_ = dialect02FF // documentation reference
 	return transport.WriteFrame(rw, full)
 }

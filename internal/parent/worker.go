@@ -2,6 +2,7 @@ package parent
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -220,7 +221,11 @@ func reExecWorker(conn net.Conn, log *slog.Logger) error {
 	}
 
 	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), workerEnvKey+"=1")
+	guid, err := serverGuid()
+	if err != nil {
+		return fmt.Errorf("server guid: %w", err)
+	}
+	cmd.Env = append(os.Environ(), workerEnvKey+"=1", serverGuidEnvKey+"="+hex.EncodeToString(guid[:]))
 	cmd.Stdin = nil
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

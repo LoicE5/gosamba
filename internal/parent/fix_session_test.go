@@ -117,6 +117,39 @@ func TestFixSession_SPNEGOWrappedTypeOneKeepsMICValid(t *testing.T) {
 	}
 }
 
+// libsmb2 6.1 (the version bundled by VLC for iOS 4.0.0-a24) starts NTLMSSP
+// with a bare type-1 token. It expects the challenge in the same form and
+// aborts with "no message type in NTLMSSP blob" if the server changes that
+// bare exchange into SPNEGO halfway through.
+func TestSessionSetup_PreservesBareNTLMSSPForLibsmb2(t *testing.T) {
+	hs := newFixCryptoHarness(t, smb2.CipherAES128CCM, fixCryptoUsers("test123"))
+	leg := hs.leg1(t, 1)
+
+	body := leg.respFrame[smb2.HeaderSize:]
+	off := int(binary.LittleEndian.Uint16(body[4:])) - smb2.HeaderSize
+	length := int(binary.LittleEndian.Uint16(body[6:]))
+	if off < 0 || off+length > len(body) {
+		t.Fatalf("challenge security buffer out of bounds: off=%d len=%d body=%d", off, length, len(body))
+	}
+	securityBuffer := body[off : off+length]
+	if !bytes.HasPrefix(securityBuffer, []byte("NTLMSSP\x00")) {
+		t.Fatalf("bare type-1 received a wrapped challenge: %x", securityBuffer[:min(len(securityBuffer), 16)])
+	}
+
+	auth := buildAuthenticate(t, leg, "alice", "WORKGROUP", "test123", true, nil)
+	hdr, reqBody, frame := sessionSetupFrame(auth.secBuf, 2, leg.sessionID)
+	if _, err := hs.h.HandleSessionSetup(hs.pipe, hdr, reqBody, frame); err != nil {
+		t.Fatalf("bare NTLMSSP authentication: %v", err)
+	}
+	final, err := transport.ReadFrame(hs.out, transport.MaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint16(final[smb2.HeaderSize+6:]); got != 0 {
+		t.Errorf("bare NTLMSSP final SecurityBufferLength = %d, want 0", got)
+	}
+}
+
 // fixSessionLeg1SPNEGO runs the type-1 leg with the NEGOTIATE_MESSAGE wrapped
 // in a real SPNEGO NegTokenInit (what macOS and Windows actually send) instead
 // of the bare message the other harness tests use. It also returns the bytes

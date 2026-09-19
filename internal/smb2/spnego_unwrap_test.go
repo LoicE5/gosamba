@@ -32,6 +32,31 @@ func TestWrapNTLMResp_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestUnwrapNTLMWithSPNEGO_ReportsWireForm(t *testing.T) {
+	ntlm := []byte("NTLMSSP\x00fake-payload")
+	for _, tc := range []struct {
+		name    string
+		blob    []byte
+		wrapped bool
+	}{
+		{name: "bare", blob: ntlm, wrapped: false},
+		{name: "SPNEGO", blob: WrapNTLMResp(SPNEGOAcceptIncomplete, ntlm), wrapped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, wrapped, err := UnwrapNTLMWithSPNEGO(tc.blob)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wrapped != tc.wrapped {
+				t.Errorf("wrapped = %v, want %v", wrapped, tc.wrapped)
+			}
+			if !bytes.Equal(got, ntlm) {
+				t.Errorf("token = %x, want %x", got, ntlm)
+			}
+		})
+	}
+}
+
 func TestWrapNTLMResp_AcceptedNoToken(t *testing.T) {
 	w := WrapNTLMResp(SPNEGOAcceptCompleted, nil)
 	if w[0] != 0xa1 {

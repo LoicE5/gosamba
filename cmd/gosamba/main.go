@@ -149,6 +149,7 @@ func run(args []string) error {
 		"version", version,
 		"listen", cfg.Server.Listen,
 		"shares", len(cfg.Shares),
+		"share_names", shareNames(cfg.Shares),
 		"users", len(cfg.Users),
 		"encryption", string(cfg.Server.Encryption),
 		"signing", string(cfg.Server.Signing),
@@ -235,6 +236,14 @@ func run(args []string) error {
 	}
 	log.Info("gosamba stopped")
 	return nil
+}
+
+func shareNames(shares []config.ShareConfig) []string {
+	names := make([]string, len(shares))
+	for i, share := range shares {
+		names[i] = share.Name
+	}
+	return names
 }
 
 func hasPlaintextPasswordFlag(args []string) bool {

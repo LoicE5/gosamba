@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -79,6 +80,46 @@ func TestMerge_SharesFromFileAndCLI(t *testing.T) {
 	}
 	if got.Shares[1].Path != "/cli" || got.Shares[1].Name != filepath.Base("/cli") {
 		t.Errorf("share[1] = %+v (name should default to basename)", got.Shares[1])
+	}
+}
+
+func TestMerge_DefaultShareNamesUseResolvedPath(t *testing.T) {
+	cwd := filepath.Join(t.TempDir(), "gosamba")
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+
+	absPath := filepath.Join(t.TempDir(), "absolute-share")
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: ".", want: "gosamba"},
+		{path: "..", want: filepath.Base(filepath.Dir(cwd))},
+		{path: filepath.Join("relative", "documents"), want: "documents"},
+		{path: absPath, want: "absolute-share"},
+	}
+
+	for _, source := range []string{"CLI", "config file"} {
+		for _, tt := range tests {
+			t.Run(source+"/"+tt.path, func(t *testing.T) {
+				var cli CLI
+				var file File
+				if source == "CLI" {
+					cli.Shares = []CLIShare{{Path: tt.path}}
+				} else {
+					file.Shares = []FileShare{{Path: tt.path}}
+				}
+				got, err := Merge(cli, file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(got.Shares) != 1 || got.Shares[0].Name != tt.want {
+					t.Fatalf("share for path %q = %+v, want name %q", tt.path, got.Shares, tt.want)
+				}
+			})
+		}
 	}
 }
 

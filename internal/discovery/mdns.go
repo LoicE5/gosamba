@@ -24,16 +24,28 @@ const (
 
 // advertiser holds the state for the mDNS responder.
 type advertiser struct {
-	conns  []*net.UDPConn
+	conns  []interfaceConn
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// interfaceConn keeps a multicast socket together with the IPv4 addresses of
+// the interface it joined. mDNS A records must describe the path on which a
+// response is sent, rather than every address configured on the host.
+type interfaceConn struct {
+	conn *net.UDPConn
+	ips  []net.IP
+}
+
+func (c interfaceConn) buildResponse(query dnsmessage.Message, instance, hostname string, port int) ([]byte, bool) {
+	return buildResponse(query, instance, hostname, c.ips, port)
 }
 
 // Close shuts down the advertiser and all listening sockets.
 func (a *advertiser) Close() error {
 	a.cancel()
 	for _, c := range a.conns {
-		c.Close()
+		c.conn.Close()
 	}
 	a.wg.Wait()
 	return nil
@@ -51,14 +63,6 @@ func Advertise(ctx context.Context, instance, hostname string, port int, log *sl
 		log = slog.Default()
 	}
 
-	ips, err := localIPv4s()
-	if err != nil || len(ips) == 0 {
-		if err == nil {
-			err = net.ErrClosed
-		}
-		return nil, err
-	}
-
 	group := &net.UDPAddr{IP: net.ParseIP(mdnsAddr), Port: mdnsPort}
 	ifaces, err := multicastIfaces()
 	if err != nil {
@@ -72,20 +76,20 @@ func Advertise(ctx context.Context, instance, hostname string, port int, log *sl
 
 	a := &advertiser{cancel: cancel}
 
-	for _, iface := range ifaces {
-		iface := iface
-		conn, err := net.ListenMulticastUDP("udp4", &iface, group)
+	for _, candidate := range ifaces {
+		conn, err := net.ListenMulticastUDP("udp4", &candidate.iface, group)
 		if err != nil {
-			log.Debug("mDNS: cannot join multicast on interface", "iface", iface.Name, "err", err)
+			log.Debug("mDNS: cannot join multicast on interface", "iface", candidate.iface.Name, "err", err)
 			continue
 		}
-		a.conns = append(a.conns, conn)
+		endpoint := interfaceConn{conn: conn, ips: candidate.ips}
+		a.conns = append(a.conns, endpoint)
 
 		a.wg.Add(1)
-		go func(conn *net.UDPConn, iface net.Interface) {
+		go func(endpoint interfaceConn) {
 			defer a.wg.Done()
-			serveLoop(rctx, conn, instance, hostname, ips, port, log)
-		}(conn, iface)
+			serveLoop(rctx, endpoint, instance, hostname, port, log)
+		}(endpoint)
 	}
 
 	if len(a.conns) == 0 {
@@ -111,14 +115,14 @@ func Advertise(ctx context.Context, instance, hostname string, port int, log *sl
 			return
 		case <-t.C:
 		}
-		announce(a.conns, instance, hostname, ips, port, log)
+		announce(a.conns, instance, hostname, port, log)
 	}()
 
 	return a, nil
 }
 
 // serveLoop reads mDNS queries from conn and answers those matching _smb._tcp.
-func serveLoop(ctx context.Context, conn *net.UDPConn, instance, hostname string, ips []net.IP, port int, log *slog.Logger) {
+func serveLoop(ctx context.Context, endpoint interfaceConn, instance, hostname string, port int, log *slog.Logger) {
 	buf := make([]byte, 4096)
 	multicast := &net.UDPAddr{IP: net.ParseIP(mdnsAddr), Port: mdnsPort}
 
@@ -129,8 +133,8 @@ func serveLoop(ctx context.Context, conn *net.UDPConn, instance, hostname string
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		n, _, err := conn.ReadFromUDP(buf)
+		endpoint.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, _, err := endpoint.conn.ReadFromUDP(buf)
 		if err != nil {
 			if isTimeout(err) {
 				continue
@@ -147,20 +151,20 @@ func serveLoop(ctx context.Context, conn *net.UDPConn, instance, hostname string
 			continue
 		}
 
-		resp, matched := buildResponse(msg, instance, hostname, ips, port)
+		resp, matched := endpoint.buildResponse(msg, instance, hostname, port)
 		if !matched || len(resp) == 0 {
 			continue
 		}
 
 		// Send response to mDNS multicast group.
-		if _, err := conn.WriteToUDP(resp, multicast); err != nil {
+		if _, err := endpoint.conn.WriteToUDP(resp, multicast); err != nil {
 			log.Debug("mDNS: write response error", "err", err)
 		}
 	}
 }
 
 // announce sends an unsolicited PTR+SRV+TXT+A announcement to all open connections.
-func announce(conns []*net.UDPConn, instance, hostname string, ips []net.IP, port int, log *slog.Logger) {
+func announce(conns []interfaceConn, instance, hostname string, port int, log *slog.Logger) {
 	query := dnsmessage.Message{
 		Header: dnsmessage.Header{Response: false},
 		Questions: []dnsmessage.Question{
@@ -171,14 +175,13 @@ func announce(conns []*net.UDPConn, instance, hostname string, ips []net.IP, por
 			},
 		},
 	}
-	resp, _ := buildResponse(query, instance, hostname, ips, port)
-	if len(resp) == 0 {
-		return
-	}
-
 	multicast := &net.UDPAddr{IP: net.ParseIP(mdnsAddr), Port: mdnsPort}
-	for _, conn := range conns {
-		if _, err := conn.WriteToUDP(resp, multicast); err != nil {
+	for _, endpoint := range conns {
+		resp, _ := endpoint.buildResponse(query, instance, hostname, port)
+		if len(resp) == 0 {
+			continue
+		}
+		if _, err := endpoint.conn.WriteToUDP(resp, multicast); err != nil {
 			log.Debug("mDNS: announce error", "err", err)
 		}
 	}
@@ -294,40 +297,62 @@ func buildResponse(query dnsmessage.Message, instance, hostname string, ips []ne
 	return msg, true
 }
 
-// localIPv4s returns the non-loopback IPv4 addresses of this host.
-func localIPv4s() ([]net.IP, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return nil, err
-	}
-	var ips []net.IP
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip4 := ipNet.IP.To4()
-		if ip4 == nil || ip4.IsLoopback() {
-			continue
-		}
-		ips = append(ips, ip4)
-	}
-	return ips, nil
+type multicastIface struct {
+	iface net.Interface
+	ips   []net.IP
 }
 
-// multicastIfaces returns interfaces that support multicast.
-func multicastIfaces() ([]net.Interface, error) {
+// multicastIfaces returns usable multicast interfaces and their own IPv4
+// addresses. Loopback is excluded by interface flags, not merely by checking
+// whether an address itself is in 127.0.0.0/8; aliases such as 10.10.10.1 on
+// lo0 must never be advertised to peers on another network.
+func multicastIfaces() ([]multicastIface, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	var out []net.Interface
+	var out []multicastIface
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagMulticast != 0 && iface.Flags&net.FlagUp != 0 {
-			out = append(out, iface)
+		if iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, err
+		}
+		ips := interfaceIPv4s(iface, addrs)
+		if len(ips) != 0 {
+			out = append(out, multicastIface{iface: iface, ips: ips})
 		}
 	}
 	return out, nil
+}
+
+// interfaceIPv4s filters an interface's address list for advertisable IPv4
+// addresses. Taking the interface as an argument makes the loopback-interface
+// rule explicit and independently testable.
+func interfaceIPv4s(iface net.Interface, addrs []net.Addr) []net.IP {
+	if iface.Flags&net.FlagLoopback != 0 {
+		return nil
+	}
+	var ips []net.IP
+	for _, addr := range addrs {
+		var ip net.IP
+		switch value := addr.(type) {
+		case *net.IPNet:
+			ip = value.IP
+		case *net.IPAddr:
+			ip = value.IP
+		default:
+			continue
+		}
+		ip4 := ip.To4()
+		if ip4 == nil || ip4.IsLoopback() || ip4.IsUnspecified() {
+			continue
+		}
+		ips = append(ips, append(net.IP(nil), ip4...))
+	}
+	return ips
 }
 
 func mustNewName(s string) dnsmessage.Name {

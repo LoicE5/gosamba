@@ -95,7 +95,11 @@ func Merge(cli CLI, file File) (Config, error) {
 	for _, fs := range file.Shares {
 		name := fs.Name
 		if name == "" {
-			name = filepath.Base(fs.Path)
+			var err error
+			name, err = defaultShareName(fs.Path)
+			if err != nil {
+				return Config{}, fmt.Errorf("share path %q: derive name: %w", fs.Path, err)
+			}
 		}
 		cfg.Shares = append(cfg.Shares, ShareConfig{
 			Name:     name,
@@ -107,7 +111,11 @@ func Merge(cli CLI, file File) (Config, error) {
 	for _, cs := range cli.Shares {
 		name := cs.Name
 		if name == "" {
-			name = filepath.Base(cs.Path)
+			var err error
+			name, err = defaultShareName(cs.Path)
+			if err != nil {
+				return Config{}, fmt.Errorf("share path %q: derive name: %w", cs.Path, err)
+			}
 		}
 		cfg.Shares = append(cfg.Shares, ShareConfig{
 			Name: name,
@@ -154,4 +162,16 @@ func Merge(cli CLI, file File) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// defaultShareName derives a stable, client-friendly name from the resolved
+// share directory. Resolving before taking the base is important for paths
+// such as "." and "..": their raw basenames are navigation markers that some
+// SMB clients hide from share listings.
+func defaultShareName(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Base(filepath.Clean(abs)), nil
 }

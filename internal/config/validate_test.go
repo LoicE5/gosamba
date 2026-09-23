@@ -75,6 +75,19 @@ func TestValidate_DuplicateShareName(t *testing.T) {
 	}
 }
 
+func TestValidate_RejectsNavigationShareNames(t *testing.T) {
+	for _, name := range []string{".", ".."} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Shares = []ShareConfig{{Name: name, Path: t.TempDir()}}
+			err := Validate(&cfg)
+			if err == nil || !strings.Contains(err.Error(), "name is reserved") || !strings.Contains(err.Error(), "descriptive name") {
+				t.Fatalf("expected actionable reserved-name error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestValidate_UnknownSystemUser(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Defaults()

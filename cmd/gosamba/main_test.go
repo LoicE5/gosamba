@@ -1,8 +1,11 @@
 package main
 
 import (
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/ahmetozer/gosamba/internal/config"
 )
 
 func TestNTHashFromReader(t *testing.T) {
@@ -24,6 +27,13 @@ func TestNTHashFromReader(t *testing.T) {
 				t.Errorf("got %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestShareNames(t *testing.T) {
+	shares := []config.ShareConfig{{Name: "Documents"}, {Name: "Photos"}}
+	if got, want := shareNames(shares), []string{"Documents", "Photos"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shareNames() = %v, want %v", got, want)
 	}
 }
 

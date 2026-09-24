@@ -1,8 +1,11 @@
 package main
 
 import (
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/ahmetozer/gosamba/internal/config"
 )
 
 func TestNTHashFromReader(t *testing.T) {
@@ -22,6 +25,39 @@ func TestNTHashFromReader(t *testing.T) {
 			}
 			if got != want {
 				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestShareNames(t *testing.T) {
+	shares := []config.ShareConfig{{Name: "Documents"}, {Name: "Photos"}}
+	if got, want := shareNames(shares), []string{"Documents", "Photos"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shareNames() = %v, want %v", got, want)
+	}
+}
+
+func TestBonjourNames(t *testing.T) {
+	tests := []struct {
+		name         string
+		listenerHost string
+		localHost    string
+		wantInstance string
+		wantHost     string
+	}{
+		{name: "empty wildcard", listenerHost: "", localHost: "media-box", wantInstance: "media-box", wantHost: "media-box"},
+		{name: "IPv4 wildcard", listenerHost: "0.0.0.0", localHost: "media-box", wantInstance: "media-box", wantHost: "media-box"},
+		{name: "IPv6 wildcard", listenerHost: "::", localHost: "media-box.local", wantInstance: "media-box", wantHost: "media-box"},
+		{name: "expanded IPv6 wildcard", listenerHost: "0:0:0:0:0:0:0:0", localHost: "media-box.local.", wantInstance: "media-box", wantHost: "media-box"},
+		{name: "explicit address", listenerHost: "192.0.2.10", localHost: "media-box", wantInstance: "media-box", wantHost: "192.0.2.10"},
+		{name: "explicit local name", listenerHost: "files.local.", localHost: "media-box", wantInstance: "media-box", wantHost: "files"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instance, host := bonjourNames(tt.listenerHost, tt.localHost)
+			if instance != tt.wantInstance || host != tt.wantHost {
+				t.Fatalf("bonjourNames(%q, %q) = (%q, %q), want (%q, %q)",
+					tt.listenerHost, tt.localHost, instance, host, tt.wantInstance, tt.wantHost)
 			}
 		})
 	}

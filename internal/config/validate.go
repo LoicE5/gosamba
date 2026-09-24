@@ -81,6 +81,9 @@ func Validate(cfg *Config) error {
 		if s.Name == "" {
 			return fmt.Errorf("share[%d]: name is empty", i)
 		}
+		if s.Name == "." || s.Name == ".." {
+			return fmt.Errorf("share %q: name is reserved; choose a descriptive name with <path>=<name> or set name in the config file", s.Name)
+		}
 		key := strings.ToLower(s.Name)
 		if _, dup := seenShares[key]; dup {
 			return fmt.Errorf("share %q: duplicate name (share names are matched case-insensitively)", s.Name)

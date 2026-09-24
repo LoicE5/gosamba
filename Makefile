@@ -1,4 +1,7 @@
-.PHONY: build build-darwin-arm64 build-darwin-amd64 test test-race test-e2e fmt vet tidy clean e2e-deps
+.PHONY: build build-darwin-arm64 build-darwin-amd64 test test-race test-e2e fmt vet tidy clean e2e-deps download
+
+download:
+	go mod download
 
 e2e-deps:
 	apt-get install -y smbclient

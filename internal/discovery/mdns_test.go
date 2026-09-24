@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -141,6 +142,52 @@ func TestBuildResponse_PTRQuery(t *testing.T) {
 	}
 	if !gotA {
 		t.Error("response missing A record")
+	}
+}
+
+func TestInterfaceIPv4s_RejectsLoopbackInterfaceAliases(t *testing.T) {
+	iface := net.Interface{Name: "lo0", Flags: net.FlagUp | net.FlagLoopback | net.FlagMulticast}
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+		&net.IPNet{IP: net.ParseIP("10.10.10.1"), Mask: net.CIDRMask(24, 32)},
+	}
+	if got := interfaceIPv4s(iface, addrs); len(got) != 0 {
+		t.Fatalf("loopback interface addresses = %v, want none", got)
+	}
+}
+
+func TestInterfaceConnResponsesUseOnlyOwnAddresses(t *testing.T) {
+	query := dnsmessage.Message{
+		Questions: []dnsmessage.Question{{
+			Name:  mustName(t, smbService),
+			Type:  dnsmessage.TypePTR,
+			Class: dnsmessage.ClassINET,
+		}},
+	}
+	endpoints := []interfaceConn{
+		{ips: []net.IP{net.ParseIP("172.30.1.86")}},
+		{ips: []net.IP{net.ParseIP("192.168.1.20")}},
+	}
+	wants := [][]string{{"172.30.1.86"}, {"192.168.1.20"}}
+
+	for i, endpoint := range endpoints {
+		buf, matched := endpoint.buildResponse(query, "gosamba", "myserver", 445)
+		if !matched {
+			t.Fatalf("interface %d response did not match", i)
+		}
+		var response dnsmessage.Message
+		if err := response.Unpack(buf); err != nil {
+			t.Fatalf("interface %d response: %v", i, err)
+		}
+		var got []string
+		for _, record := range response.Additionals {
+			if a, ok := record.Body.(*dnsmessage.AResource); ok {
+				got = append(got, net.IP(a.A[:]).String())
+			}
+		}
+		if !reflect.DeepEqual(got, wants[i]) {
+			t.Fatalf("interface %d A records = %v, want %v", i, got, wants[i])
+		}
 	}
 }
 
